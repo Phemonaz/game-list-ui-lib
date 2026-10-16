@@ -97,11 +97,10 @@
    code cannot leak connections.
 
  LOADING / DISTRIBUTION (the registrations below never change between methods)
-   A. Local standalone: run this file as-is. The example block at the bottom
-      registers placeholder games. Set RUN_EXAMPLE = false to disable it.
+   A. Local standalone: loadstring(readfile("UniversalLibrary.lua"))() returns
+      the library table. The file registers nothing and shows nothing by itself.
    B. ModuleScript: paste this file into a ModuleScript. It returns the library
       table, so:  local UL = require(path.To.UniversalLibrary)
-      (set RUN_EXAMPLE = false first so requiring has no side effects).
    C. Remote (optional, executor-dependent, NEVER required by the library):
         local URL = "https://YOUR-HOST/universal/v1.0.0/UniversalLibrary.lua"
         local ok, src = pcall(function() return game:HttpGet(URL) end)
@@ -128,7 +127,6 @@
 ]]
 
 local LIB_VERSION = "1.0.0"
-local RUN_EXAMPLE = true
 
 local LOG_TAG = "[Universal]"
 local ACTION_NAME = "UniversalLibrarySearchSink"
@@ -2495,79 +2493,6 @@ function Library:Destroy(clearRegistry)
 		self._matchedId = nil
 	end
 	self._destroying = false
-end
-
-----------------------------------------------------------------------
--- 7. EXAMPLE (placeholder callbacks only; replace with your own logic)
-----------------------------------------------------------------------
-
-if RUN_EXAMPLE then
-	local Library = UniversalLibrary.new({
-		Title = "UNIVERSAL",
-		Subtitle = "GAME SCRIPT LIBRARY",
-		Version = "1.0.0",
-		Theme = "Monochrome",
-	})
-
-	-- Features are plain labels. Run is what the RUN button executes.
-	Library:AddGame({
-		Id = "the-bronx",
-		Title = "The Bronx",
-		Description = "Game-specific utilities. Replace PlaceIds with your game's place id; its thumbnail is downloaded for the icon.",
-		PlaceIds = { 920587237 }, -- example place id, replace with your own
-		Features = {
-			"Feature One",
-			"Feature Two",
-			{ Title = "Feature Three", Description = "Features can carry a description (shown on hover)" },
-		},
-		Callback = function(entry)
-			print("Selected game:", entry.Title)
-		end,
-		Run = function(entry)
-			print("Running:", entry.Title) -- start your own script here
-		end,
-	})
-
-	Library:AddGame({
-		Id = "example-game",
-		Title = "Example Game",
-		Description = "A second registered game with no features and no script (RUN is disabled).",
-		PlaceIds = { 4924922222 },
-	})
-
-	Library:AddGame({
-		Id = "modular-demo",
-		Title = "Modular Demo",
-		Description = "RUN calls Initialize, then Run. STOP (or switching games) calls Cleanup and releases the Janitor.",
-		Version = "0.1.0",
-		Features = { "Listed by the game module", "Another listed item" },
-		Module = {
-			Initialize = function(context)
-				context.Log("Modular Demo initialised")
-				context.Janitor:Add(function()
-					print("Janitor released Modular Demo resources")
-				end)
-			end,
-			Cleanup = function()
-				print("Modular Demo cleaned up")
-			end,
-		},
-		Run = function()
-			Library:Notify({ Title = "Modular Demo", Message = "Started", Duration = 3 })
-		end,
-	})
-
-	Library:AddGame({
-		Id = "coming-soon",
-		Title = "Coming Soon",
-		Description = "Disabled entries stay visible but cannot run.",
-		Enabled = false,
-	})
-
-	local ok, err = Library:Init()
-	if not ok then
-		warn("[Universal] Init failed:", err)
-	end
 end
 
 return UniversalLibrary
