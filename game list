@@ -23,8 +23,10 @@
    * The Drawing API cannot capture input. Clicks on the window also reach the
      game underneath. This is a platform limitation, not a bug.
    * Drawing has no clipping. Lists therefore scroll in whole rows.
-   * Icons are rendered as monochrome initials (Drawing "Image" is not used so
-     the UI stays strictly black-and-white and dependency-free).
+   * Game thumbnails need Drawing.new("Image") (Image.Data = PNG bytes) AND an
+     HTTP function (request / http_request / syn.request / game:HttpGet) that can
+     reach thumbnails.roblox.com. If either is missing, or the download fails,
+     the icon box falls back to a monochrome initial. Everything else still works.
 
  PUBLIC API
    UniversalLibrary.new(config)  -> Library
@@ -42,7 +44,7 @@
    Library:AddFeature(gameId, feature) -> feature
    Library:Notify(config | string)    Library:SetTheme(name | table)
    Library:Init() -> bool, err        Library:Destroy([clearRegistry])
-   Extras: Library:SetVisible(bool), UniversalLibrary.GetCapabilities()
+   Extras: Library:SetVisible(bool), Library:RunGame(id), UniversalLibrary.GetCapabilities()
 
  AddGame(config) FIELDS
    Id           string   unique. If omitted it is generated from Title:
@@ -51,30 +53,40 @@
                          or generated) is rejected, never silently replaced.
    Title        string   display name (falls back to Id).
    Description  string   short summary.
-   PlaceIds     number | {number}   optional, used for place detection only.
+   PlaceIds     number | {number}   optional. The FIRST id is used to download
+                         the game's thumbnail for the icon box; all ids are used
+                         for current-place detection.
+   IconPlaceId  number   optional, overrides which place the thumbnail comes from.
    Version      string   optional module version.
-   Enabled      bool     default true. Disabled games can be viewed but their
-                         module is not started and their features cannot run.
-   Icon         string   optional, up to 3 characters shown instead of the initial.
+   Enabled      bool     default true. Disabled games can be viewed but not run.
+   Icon         string   optional, up to 3 characters shown if no thumbnail loads.
    Callback     function(game)   called after the user selects the game.
-   Features     { {Id, Title, Description, Enabled, Callback, Toggle, Default} }
+   Run          function(game)   called when the user presses RUN (see below).
+   Features     { "Name", ... } or { {Id, Title, Description, Enabled}, ... }
    Module       { Initialize(context), Cleanup(), Features = {...}, Settings = {...} }
    Any other keys are kept on the game table (forward compatible).
 
- FEATURE CALLBACK
-   Callback(feature, game) runs in its own thread through pcall. For toggle
-   features (Toggle = true) feature.State already holds the NEW state when the
-   callback runs; if the callback errors the previous state is restored.
-   Set RequiresModule = false on a feature to allow it while the module is not
-   active.
+ FEATURES
+   Features are a plain, read-only list under the game description (hover for
+   the description, click to pin it at the bottom). They are labels: the UI never
+   executes them, and there are no per-feature buttons or toggles.
+
+ RUN BUTTON
+   The RUN button next to the game title starts the game:
+     * with a Module, Initialize(context) runs first (async); when it succeeds
+       the button becomes STOP, and pressing STOP runs Cleanup
+     * Run(game) then runs in its own pcall'd thread (after Initialize, if any).
+       This is the place to load or start your own script.
+     * a failure shows a notification and sets the header status to ERROR
+   The button is disabled for games with neither Run nor Module, and for
+   disabled games.
 
  MODULE CONTRACT / LIFECYCLE
-   Select an enabled game with a Module:
-     1. any previously selected game's module is cleaned up first
-     2. Initialize(context) runs in a separate thread (the UI stays responsive);
-        status shows INITIALIZING, then ACTIVE or FAILED
-     3. the game's selection Callback runs
-   Switch to another game, deselect, remove the game, or Destroy():
+   Press RUN on an enabled game with a Module:
+     1. Initialize(context) runs in a separate thread (the UI stays responsive);
+        the button shows STARTING, then STOP (or RUN again if it FAILED)
+     2. the game's Run function runs, if there is one
+   Press STOP, switch to another game, deselect, remove the game, or Destroy():
      Cleanup() runs (only if Initialize succeeded), then everything added to
      context.Janitor is released. If you switch away while Initialize is still
      running, cleanup happens as soon as it returns.
@@ -105,12 +117,11 @@
  ADDING ANOTHER GAME
    Library:AddGame({
        Id = "my-game", Title = "My Game", Description = "What it does",
-       PlaceIds = { 1234567890 },
-       Callback = function(entry) print("selected", entry.Title) end,
-       Features = {
-           { Title = "Do thing", Callback = function(feature, entry) ... end },
-           { Title = "Flag", Toggle = true, Callback = function(feature) print(feature.State) end },
-       },
+       PlaceIds = { 1234567890 },          -- thumbnail + current-place detection
+       Features = { "Feature one", "Feature two" },
+       Run = function(entry)
+           -- start your own script here
+       end,
    })
    No UI code needs to change; the sidebar and detail panel update automatically.
 ================================================================================
@@ -192,7 +203,8 @@ end
 local function wrapText(str, maxChars, maxLines)
 	maxChars = math.max(4, maxChars)
 	local lines, cur = {}, ""
-	for word in tostring(str):gmatch("%S+") do
+	for w in tostring(str):gmatch("%S+") do
+		local word = w
 		while ulen(word) > maxChars do
 			if cur ~= "" then
 				lines[#lines + 1] = cur
@@ -345,6 +357,7 @@ local function getCapabilities()
 		Drawing = false,
 		Square = false,
 		Text = false,
+		Image = false,
 		Font = 3,
 		FontName = "Monospace",
 		GetEnv = getEnvTable() ~= nil,
@@ -356,6 +369,7 @@ local function getCapabilities()
 		caps.Drawing = true
 		caps.Square = probeDrawing("Square")
 		caps.Text = probeDrawing("Text")
+		caps.Image = probeDrawing("Image")
 		local okF, f = pcall(function()
 			return Drawing.Fonts.Monospace
 		end)
@@ -365,6 +379,88 @@ local function getCapabilities()
 	end
 	capsCache = caps
 	return caps
+end
+
+----------------------------------------------------------------------
+-- 2b. THUMBNAILS  (place id -> game icon PNG bytes, cached per session)
+----------------------------------------------------------------------
+
+local HttpService = game:GetService("HttpService")
+
+local function httpGet(url)
+	local reqFn = (type(request) == "function" and request)
+		or (type(http_request) == "function" and http_request)
+		or (type(syn) == "table" and type(syn.request) == "function" and syn.request)
+		or (type(fluxus) == "table" and type(fluxus.request) == "function" and fluxus.request)
+	if reqFn then
+		local ok, res = pcall(reqFn, { Url = url, Method = "GET" })
+		if ok and type(res) == "table" and type(res.Body) == "string"
+			and (res.StatusCode == nil or res.StatusCode == 200) then
+			return res.Body
+		end
+	end
+	local ok, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if ok and type(body) == "string" then
+		return body
+	end
+	return nil
+end
+
+local function fetchPlaceIcon(placeId)
+	local meta = httpGet(string.format(
+		"https://thumbnails.roblox.com/v1/places/gameicons?placeIds=%.0f&returnPolicy=PlaceHolder&size=150x150&format=Png&isCircular=false",
+		placeId
+	))
+	if not meta then
+		return nil
+	end
+	local ok, json = pcall(HttpService.JSONDecode, HttpService, meta)
+	local entry = ok and type(json) == "table" and type(json.data) == "table" and json.data[1]
+	if not entry or entry.state ~= "Completed" or type(entry.imageUrl) ~= "string" then
+		return nil
+	end
+	return httpGet(entry.imageUrl)
+end
+
+local Thumbs = { data = {}, state = {}, waiters = {} }
+
+-- state[pid]: nil (never requested) | "loading" | "ready" | "failed"
+function Thumbs.Request(pid, cb)
+	local st = Thumbs.state[pid]
+	if st == "ready" or st == "failed" then
+		if cb then
+			cb()
+		end
+		return
+	end
+	local w = Thumbs.waiters[pid]
+	if not w then
+		w = {}
+		Thumbs.waiters[pid] = w
+	end
+	if cb then
+		table.insert(w, cb)
+	end
+	if st == "loading" then
+		return
+	end
+	Thumbs.state[pid] = "loading"
+	task.spawn(function()
+		local ok, data = pcall(fetchPlaceIcon, pid)
+		if ok and type(data) == "string" and #data > 100 then
+			Thumbs.data[pid] = data
+			Thumbs.state[pid] = "ready"
+		else
+			Thumbs.state[pid] = "failed"
+		end
+		local list = Thumbs.waiters[pid]
+		Thumbs.waiters[pid] = nil
+		for _, f in ipairs(list or {}) do
+			pcall(f)
+		end
+	end)
 end
 
 ----------------------------------------------------------------------
@@ -457,7 +553,7 @@ function Node:_flush()
 	local ox = self.absolute and 0 or r.ox
 	local oy = self.absolute and 0 or r.oy
 	self:_prop("Position", Vector2.new(math.floor(ox + self.lx + 0.5), math.floor(oy + self.ly + 0.5)))
-	if self.kind == "Rect" then
+	if self.kind == "Rect" or self.kind == "Image" then
 		self:_prop("Size", Vector2.new(self.w, self.h))
 	end
 	self:_prop("Visible", true)
@@ -493,6 +589,10 @@ end
 
 function Node:SetFilled(b)
 	self:_prop("Filled", b)
+end
+
+function Node:SetImage(data)
+	self:_prop("Data", data)
 end
 
 function Node:SetText(s)
@@ -615,6 +715,35 @@ function Renderer:Label(o)
 	return node
 end
 
+-- Image: Size is set to the box size exactly. Game icons are square, so a
+-- square box gives a perfect fit with no stretching. Without Drawing "Image"
+-- support this returns an inert stub and the UI shows initials instead.
+local NOOP_NODE = setmetatable({}, { __index = function()
+	return function() end
+end })
+
+function Renderer:Image(o)
+	if not self.caps.Image then
+		return NOOP_NODE
+	end
+	local node = setmetatable({
+		obj = Drawing.new("Image"),
+		kind = "Image",
+		lx = o.x or 0,
+		ly = o.y or 0,
+		w = o.w or 0,
+		h = o.h or 0,
+		token = "text",
+		absolute = o.absolute,
+		z = o.z or 4,
+	}, Node)
+	self:_register(node, o.group)
+	node:_prop("Transparency", 1)
+	node.shown = false
+	node:_flush()
+	return node
+end
+
 function Renderer:SetOrigin(x, y)
 	x, y = math.floor(x), math.floor(y)
 	if x == self.ox and y == self.oy then
@@ -655,7 +784,9 @@ end
 function Renderer:ApplyTheme(theme)
 	self.theme = theme
 	for _, n in ipairs(self.nodes) do
-		n:_prop("Color", theme[n.token])
+		if n.kind ~= "Image" then
+			n:_prop("Color", theme[n.token])
+		end
 	end
 end
 
@@ -678,8 +809,7 @@ local L = {
 	W = 680, H = 460,
 	HEADER = 46, SIDEBAR = 230, PAD = 16,
 	ROW_H = 40, FEAT_H = 40, FEAT_GAP = 4,
-	LOG_H = 92, TOAST_W = 260, TOAST_H = 46,
-	MAX_LOGS = 80,
+	TOAST_W = 260, TOAST_H = 46, LIST_ROW = 22,
 }
 
 local LEVEL_MARK = { info = "-", ok = "+", warn = "!", error = "x" }
@@ -723,7 +853,9 @@ function UI.new(lib, caps)
 	self.lib, self.caps = lib, caps
 	self.janitor = Janitor.new()
 	self.regions, self.slots, self.featSlots, self.toastSlots = {}, {}, {}, {}
-	self.descLines, self.logLines, self.cards = {}, {}, {}
+	self.descLines, self.cards = {}, {}
+	self.thumbWait = {}
+	self.selectedFeature = nil
 	self.welcomeLines = {}
 	self.listOffset, self.featOffset = 0, 0
 	self.tipToken, self.filterToken = 0, 0
@@ -892,7 +1024,7 @@ function UI:Build()
 	-- sidebar ------------------------------------------------------------
 	r:Rect({ y = HEADER, w = SB, h = H - HEADER, token = "panel", group = gBody, z = 2 })
 	r:Rect({ x = SB, y = HEADER, w = 1, h = H - HEADER, token = "border", group = gBody, z = 3 })
-	r:Label({ x = 14, y = HEADER + 14, size = 11, text = "GAMES", token = "text", group = gBody, z = 6 })
+	r:Label({ x = 14, y = HEADER + 14, size = 11, text = "SUPPORTED GAMES", token = "text", group = gBody, z = 6 })
 	self.countLbl = r:Label({ x = SB - 14, y = HEADER + 15, size = 10, align = "right", token = "textDim", group = gBody, z = 6 })
 
 	local sy = HEADER + 38
@@ -914,12 +1046,13 @@ function UI:Build()
 		local slot = { hover = false }
 		slot.bg = r:Rect({ x = 6, y = y, w = rowW, h = L.ROW_H - 2, token = "panel", group = gBody, z = 3 })
 		slot.bar = r:Rect({ x = 6, y = y + 6, w = 2, h = L.ROW_H - 14, token = "panel", group = gBody, z = 5 })
+		slot.img = r:Image({ x = 17, y = y + 6, w = 26, h = 26, group = gBody, z = 4 })
 		slot.box = r:Rect({ x = 16, y = y + 5, w = 28, h = 28, filled = false, token = "border", group = gBody, z = 5 })
 		slot.initial = r:Label({ x = 30, y = y + 11, size = 13, align = "center", token = "textDim", group = gBody, z = 6 })
 		slot.title = r:Label({ x = 54, y = y + 6, size = 13, token = "text", group = gBody, z = 6 })
 		slot.desc = r:Label({ x = 54, y = y + 22, size = 10, token = "muted", group = gBody, z = 6 })
 		slot.dot = r:Rect({ x = SB - 28, y = y + 16, w = 5, h = 5, token = "textDim", group = gBody, z = 6 })
-		slot.nodes = { slot.bg, slot.bar, slot.box, slot.initial, slot.title, slot.desc, slot.dot }
+		slot.nodes = { slot.bg, slot.bar, slot.img, slot.box, slot.initial, slot.title, slot.desc, slot.dot }
 		slot.region = self:AddRegion({
 			x = 6, y = y, w = rowW, h = L.ROW_H - 2, group = gBody, z = 4, on = false,
 			onClick = function()
@@ -980,55 +1113,87 @@ function UI:Build()
 	self.placeHint = r:Label({ x = cx, y = top + 170, size = 11, token = "textDim", group = gWelcome, z = 6 })
 
 	-- game view ----------------------------------------------------------
-	self.gameBox = r:Rect({ x = cx, y = top, w = 40, h = 40, filled = false, token = "text", group = gGame, z = 5 })
-	self.gameInitial = r:Label({ x = cx + 20, y = top + 11, size = 18, align = "center", token = "text", group = gGame, z = 6 })
-	self.gameTitleChars = r:Capacity(cw - 54, 18)
-	self.gameTitle = r:Label({ x = cx + 54, y = top + 1, size = 18, token = "text", group = gGame, z = 6 })
-	self.infoChars = r:Capacity(cw - 54, 10)
-	self.gameInfo = r:Label({ x = cx + 54, y = top + 26, size = 10, token = "textDim", group = gGame, z = 6 })
+	local ICON, runW = 52, 88
+	self.gameImg = r:Image({ x = cx + 1, y = top + 1, w = ICON - 2, h = ICON - 2, group = gGame, z = 4 })
+	self.gameBox = r:Rect({ x = cx, y = top, w = ICON, h = ICON, filled = false, token = "text", group = gGame, z = 5 })
+	self.gameInitial = r:Label({ x = cx + ICON / 2, y = top + ICON / 2 - 12, size = 20, align = "center", token = "text", group = gGame, z = 6 })
+	local textX = cx + ICON + 14
+	local titlePx = cw - ICON - 14 - runW - 12
+	self.gameTitleChars = r:Capacity(titlePx, 18)
+	self.gameTitle = r:Label({ x = textX, y = top + 6, size = 18, token = "text", group = gGame, z = 6 })
+	self.infoChars = r:Capacity(titlePx, 10)
+	self.gameInfo = r:Label({ x = textX, y = top + 32, size = 10, token = "textDim", group = gGame, z = 6 })
+	self.runBtn = self:Button({
+		x = cx + cw - runW, y = top + 12, w = runW, h = 28, text = "RUN", size = 12, group = gGame, z = 7,
+		onClick = function()
+			local g = lib._games[lib._selectedId]
+			if g then
+				lib:_runGame(g)
+			end
+		end,
+		tooltip = function()
+			local g = lib._games[lib._selectedId]
+			if not g then
+				return nil
+			end
+			if not g.Enabled then
+				return "Unavailable"
+			end
+			if type(g.Run) ~= "function" and type(g.Module) ~= "table" then
+				return "No script attached"
+			end
+			return g._moduleState == "active" and "Stop and clean up" or "Run this game's script"
+		end,
+	})
 	self.descChars = r:Capacity(cw, 12)
 	for i = 1, 3 do
-		self.descLines[i] = r:Label({ x = cx, y = top + 52 + (i - 1) * 15, size = 12, token = "textDim", group = gGame, z = 6 })
+		self.descLines[i] = r:Label({ x = cx, y = top + ICON + 14 + (i - 1) * 15, size = 12, token = "textDim", group = gGame, z = 6 })
 	end
-	r:Label({ x = cx, y = top + 110, size = 10, text = "FEATURES", token = "text", group = gGame, z = 6 })
-	self.featCountLbl = r:Label({ x = cx + cw, y = top + 110, size = 10, align = "right", token = "textDim", group = gGame, z = 6 })
-	r:Rect({ x = cx, y = top + 126, w = cw, h = 1, token = "border", group = gGame, z = 3 })
+	r:Label({ x = cx, y = top + 124, size = 10, text = "FEATURES", token = "text", group = gGame, z = 6 })
+	self.featCountLbl = r:Label({ x = cx + cw, y = top + 124, size = 10, align = "right", token = "textDim", group = gGame, z = 6 })
+	r:Rect({ x = cx, y = top + 140, w = cw, h = 1, token = "border", group = gGame, z = 3 })
 
-	local listTop = top + 134
-	local logTop = H - L.LOG_H - 12
-	local avail = logTop - 10 - listTop
-	local fn = math.max(1, math.floor((avail + L.FEAT_GAP) / (L.FEAT_H + L.FEAT_GAP)))
+	-- plain feature list (text rows; hover for description, click to pin it)
+	local listTop = top + 148
+	local rows = math.max(1, math.floor((H - 56 - listTop) / L.LIST_ROW))
 	self.featListTop = listTop
-	self.featListH = fn * (L.FEAT_H + L.FEAT_GAP) - L.FEAT_GAP
-	local btnW = 60
-	local textPx2 = cw - 12 - btnW - 8 - 12
-	self.featTitleChars, self.featDescChars = r:Capacity(textPx2, 12), r:Capacity(textPx2, 10)
-	for i = 1, fn do
-		local y = listTop + (i - 1) * (L.FEAT_H + L.FEAT_GAP)
-		local slot = {}
-		slot.bg = r:Rect({ x = cx, y = y, w = cw, h = L.FEAT_H, token = "panel", group = gGame, z = 3 })
-		slot.border = r:Rect({ x = cx, y = y, w = cw, h = L.FEAT_H, filled = false, token = "border", group = gGame, z = 4 })
-		slot.title = r:Label({ x = cx + 12, y = y + 6, size = 12, token = "text", group = gGame, z = 6 })
-		slot.desc = r:Label({ x = cx + 12, y = y + 23, size = 10, token = "textDim", group = gGame, z = 6 })
-		slot.nodes = { slot.bg, slot.border, slot.title, slot.desc }
-		slot.btn = self:Button({
-			x = cx + cw - btnW - 8, y = y + 8, w = btnW, h = 24, text = "RUN", group = gGame, z = 7,
+	self.featListH = rows * L.LIST_ROW
+	self.featChars = r:Capacity(cw - 24, 12)
+	for i = 1, rows do
+		local y = listTop + (i - 1) * L.LIST_ROW
+		local slot = { hover = false }
+		slot.bg = r:Rect({ x = cx, y = y, w = cw, h = L.LIST_ROW - 2, token = "bg", group = gGame, z = 3 })
+		slot.label = r:Label({ x = cx + 10, y = y + 4, size = 12, token = "textDim", group = gGame, z = 6 })
+		slot.nodes = { slot.bg, slot.label }
+		slot.region = self:AddRegion({
+			x = cx, y = y, w = cw, h = L.LIST_ROW - 2, group = gGame, z = 4, on = false,
 			onClick = function()
-				local g = lib._games[lib._selectedId]
-				if g and slot.feature then
-					lib:_activateFeature(g, slot.feature)
+				if slot.feature then
+					self.selectedFeature = slot.feature.Id
+					self:RefreshFeatures()
 				end
+			end,
+			onEnter = function()
+				slot.hover = true
+				self:RefreshFeatureVisual(slot)
+			end,
+			onLeave = function()
+				slot.hover = false
+				self:RefreshFeatureVisual(slot)
 			end,
 			tooltip = function()
 				local f = slot.feature
-				return f and (f.Description or f.Title) or nil
+				if f and f.Description ~= "" then
+					return f.Description
+				end
+				return nil
 			end,
 		})
 		self.featSlots[i] = slot
 	end
 	self.featTrack = r:Rect({ x = W - 10, y = listTop, w = 3, h = self.featListH, token = "border", group = gGame, z = 3 })
 	self.featThumb = r:Rect({ x = W - 10, y = listTop, w = 3, h = 20, token = "textDim", group = gGame, z = 4 })
-	self.featEmpty = r:Label({ x = cx + cw / 2, y = listTop + 16, size = 11, align = "center", token = "muted", group = gGame, z = 6 })
+	self.featEmpty = r:Label({ x = cx + cw / 2, y = listTop + 10, size = 11, align = "center", token = "muted", group = gGame, z = 6 })
 	self:AddRegion({
 		x = cx, y = listTop, w = cw, h = self.featListH, group = gGame, z = 2,
 		onScroll = function(d)
@@ -1036,15 +1201,10 @@ function UI:Build()
 			self:RefreshFeatures()
 		end,
 	})
-
-	-- log panel ----------------------------------------------------------
-	r:Rect({ x = cx, y = logTop, w = cw, h = L.LOG_H, token = "panel", group = gBody, z = 3 })
-	r:Rect({ x = cx, y = logTop, w = cw, h = L.LOG_H, filled = false, token = "border", group = gBody, z = 4 })
-	r:Label({ x = cx + 10, y = logTop + 7, size = 10, text = "LOG", token = "textDim", group = gBody, z = 6 })
-	self.logChars = r:Capacity(cw - 20, 10)
-	for i = 1, 5 do
-		self.logLines[i] = r:Label({ x = cx + 10, y = logTop + 22 + (i - 1) * 13, size = 10, token = "textDim", group = gBody, z = 6 })
-	end
+	r:Rect({ x = cx, y = H - 50, w = cw, h = 38, token = "panel", group = gGame, z = 3 })
+	r:Rect({ x = cx, y = H - 50, w = cw, h = 38, filled = false, token = "border", group = gGame, z = 4 })
+	self.detailChars = r:Capacity(cw - 24, 11)
+	self.detailLbl = r:Label({ x = cx + 12, y = H - 38, size = 11, token = "muted", group = gGame, z = 6 })
 
 	-- toasts -------------------------------------------------------------
 	self.toastChars = r:Capacity(L.TOAST_W - 24, 10)
@@ -1455,6 +1615,7 @@ function UI:RefreshList()
 			slot.title:SetText(fit(g.Title, self.rowTitleChars))
 			slot.desc:SetText(fit(g.Description or "", self.rowDescChars))
 			self:SetSlotShown(slot, true)
+			self:ApplyThumb(slot.img, slot.initial, g)
 			self:RefreshSlotVisual(slot)
 		else
 			slot.id = nil
@@ -1499,14 +1660,42 @@ function UI:RefreshWelcome()
 	self.placeHint:SetText(m and fit("Current place matches: " .. m.Title, self.welcomeChars) or "")
 end
 
+function UI:ApplyThumb(img, initial, g)
+	local pid = g._thumbPlace
+	if pid and self.caps.Image then
+		local st = Thumbs.state[pid]
+		if st == "ready" then
+			img:SetImage(Thumbs.data[pid])
+			img:Show(true)
+			initial:Show(false)
+			return
+		elseif st == nil or (st == "loading" and not self.thumbWait[pid]) then
+			self.thumbWait[pid] = true
+			Thumbs.Request(pid, function()
+				if not self.dead then
+					self.lib:_refresh("List", "Content")
+				end
+			end)
+		end
+	end
+	img:Show(false)
+	initial:Show(true)
+end
+
 function UI:RefreshGame(g)
 	self.gameInitial:SetText(g._initial)
+	self:ApplyThumb(self.gameImg, self.gameInitial, g)
 	self.gameTitle:SetText(fit(g.Title, self.gameTitleChars))
+	local state = g._moduleState
 	local parts = {}
 	if not g.Enabled then
 		parts[#parts + 1] = "UNAVAILABLE"
-	elseif g.Module then
-		parts[#parts + 1] = "MODULE " .. string.upper(g._moduleState)
+	elseif state == "active" or g._running then
+		parts[#parts + 1] = "RUNNING"
+	elseif state == "initializing" then
+		parts[#parts + 1] = "STARTING"
+	elseif state == "failed" then
+		parts[#parts + 1] = "FAILED"
 	else
 		parts[#parts + 1] = "READY"
 	end
@@ -1517,12 +1706,37 @@ function UI:RefreshGame(g)
 		parts[#parts + 1] = "CURRENT PLACE"
 	end
 	self.gameInfo:SetText(fit(table.concat(parts, "  |  "), self.infoChars))
+
+	-- RUN / STOP button
+	local hasScript = type(g.Run) == "function" or type(g.Module) == "table"
+	local label, enabled, active = "RUN", g.Enabled and hasScript, false
+	if g._running then
+		label, enabled = "RUNNING", false
+	elseif state == "initializing" then
+		label, enabled = "STARTING", false
+	elseif state == "active" then
+		label, enabled, active = "STOP", g.Enabled, true
+	end
+	self.runBtn:SetText(label)
+	self.runBtn:SetActive(active)
+	self.runBtn:SetEnabled(enabled and true or false)
+
 	local desc = (g.Description and g.Description ~= "") and g.Description or "No description provided."
 	local lines = wrapText(desc, self.descChars, #self.descLines)
 	for i, node in ipairs(self.descLines) do
 		node:SetText(lines[i] or "")
 	end
 	self.featCountLbl:SetText(#g.Features .. (#g.Features == 1 and " ITEM" or " ITEMS"))
+end
+
+function UI:RefreshFeatureVisual(slot)
+	local f = slot.feature
+	if not f then
+		return
+	end
+	local selected = self.selectedFeature == f.Id
+	slot.bg:SetToken(selected and "panel2" or (slot.hover and "hover" or "bg"))
+	slot.label:SetToken(f.Enabled and ((selected or slot.hover) and "text" or "textDim") or "muted")
 end
 
 function UI:RefreshFeatures()
@@ -1538,36 +1752,34 @@ function UI:RefreshFeatures()
 		local f = list[self.featOffset + i]
 		slot.feature = f
 		if f then
-			local canRun = g.Enabled and f.Enabled
-			slot.title:SetText(fit(f.Title, self.featTitleChars))
-			slot.desc:SetText(fit(f.Description or "", self.featDescChars))
-			slot.title:SetToken(canRun and "text" or "muted")
+			slot.label:SetText(fit("- " .. f.Title, self.featChars))
 			for _, node in ipairs(slot.nodes) do
 				node:Show(true)
 			end
-			slot.btn:Show(true)
-			if f._running then
-				slot.btn:SetText("...")
-			elseif f.Toggle then
-				slot.btn:SetText(f.State and "ON" or "OFF")
-			else
-				slot.btn:SetText("RUN")
-			end
-			slot.btn:SetActive(f.Toggle == true and f.State == true)
-			slot.btn:SetEnabled(canRun and not f._running)
+			slot.region.on = true
+			self:RefreshFeatureVisual(slot)
 		else
+			slot.hover = false
 			for _, node in ipairs(slot.nodes) do
 				node:Show(false)
 			end
-			slot.btn:Show(false)
+			slot.region.on = false
 		end
 	end
 	updateScrollbar(self.featTrack, self.featThumb, self.featListTop, self.featListH, self.featOffset, #list, n)
 	if #list == 0 then
-		self.featEmpty:SetText("No features registered for this game")
+		self.featEmpty:SetText("No features listed for this game")
 		self.featEmpty:Show(true)
 	else
 		self.featEmpty:Show(false)
+	end
+	local sel = self.selectedFeature and g._featureIndex[self.selectedFeature]
+	if sel then
+		self.detailLbl:SetText(fit(sel.Title .. ": " .. (sel.Description ~= "" and sel.Description or "No description"), self.detailChars))
+		self.detailLbl:SetToken("textDim")
+	else
+		self.detailLbl:SetText("Hover or click a feature for details")
+		self.detailLbl:SetToken("muted")
 	end
 	self:ReHover()
 end
@@ -1588,28 +1800,11 @@ function UI:RefreshContent()
 	end
 end
 
-function UI:RefreshLog()
-	local logs = self.lib._logs
-	local n = #self.logLines
-	for i = 1, n do
-		local e = logs[#logs - n + i]
-		local node = self.logLines[i]
-		if e then
-			local text = LEVEL_MARK[e.level] .. " " .. e.msg .. (e.count > 1 and (" (x" .. e.count .. ")") or "")
-			node:SetText(fit(text, self.logChars))
-			node:SetToken((e.level == "info") and "textDim" or "text")
-		else
-			node:SetText("")
-		end
-	end
-end
-
 function UI:RefreshAll()
 	self:RefreshHeader()
 	self:RefreshSearch()
 	self:RefreshList()
 	self:RefreshContent()
-	self:RefreshLog()
 end
 
 function UI:ApplyTheme()
@@ -1644,24 +1839,20 @@ function UniversalLibrary.GetCapabilities()
 end
 
 -- internal helpers ---------------------------------------------------------
+-- Console-only diagnostics (no on-screen log). Consecutive duplicates are dropped
+-- so a failing callback cannot flood the output.
 function Library:_log(level, msg)
 	msg = tostring(msg):gsub("%s+", " ")
-	local logs = self._logs
-	local last = logs[#logs]
-	if last and last.msg == msg and last.level == level then
-		last.count = last.count + 1
-	else
-		table.insert(logs, { level = level, msg = msg, count = 1 })
-		if #logs > L.MAX_LOGS then
-			table.remove(logs, 1)
-		end
-		if level == "error" or level == "warn" then
-			warn(LOG_TAG, msg)
-		elseif self._debug then
-			print(LOG_TAG, msg)
-		end
+	local key = level .. ":" .. msg
+	if self._lastLog == key then
+		return
 	end
-	self:_refresh("Log")
+	self._lastLog = key
+	if level == "error" or level == "warn" then
+		warn(LOG_TAG, msg)
+	elseif self._debug then
+		print(LOG_TAG, msg)
+	end
 end
 
 -- Invalid arguments: raise when Strict (default), otherwise log + return nil, msg.
@@ -1728,14 +1919,14 @@ end
 
 -- validation ---------------------------------------------------------------
 local function normaliseFeature(def)
+	if type(def) == "string" then
+		def = { Title = def }
+	end
 	if type(def) ~= "table" then
-		return nil, "a feature must be a table"
+		return nil, "a feature must be a string or a table"
 	end
 	if not isString(def.Title) and not isString(def.Id) then
 		return nil, "a feature needs a Title or an Id"
-	end
-	if def.Callback ~= nil and type(def.Callback) ~= "function" then
-		return nil, "feature Callback must be a function"
 	end
 	if def.Description ~= nil and type(def.Description) ~= "string" then
 		return nil, "feature Description must be a string"
@@ -1746,10 +1937,8 @@ local function normaliseFeature(def)
 	if f.Id == "" then
 		return nil, "could not derive a feature id"
 	end
+	f.Description = def.Description or ""
 	f.Enabled = def.Enabled ~= false
-	f.Toggle = def.Toggle == true
-	f.State = f.Toggle and (def.Default == true or def.State == true) or false
-	f._running = false
 	return f
 end
 
@@ -1894,6 +2083,9 @@ function Library:AddGame(config)
 	if config.Callback ~= nil and type(config.Callback) ~= "function" then
 		return self:_fail("AddGame", "Callback must be a function")
 	end
+	if config.Run ~= nil and type(config.Run) ~= "function" then
+		return self:_fail("AddGame", "Run must be a function")
+	end
 	if config.Icon ~= nil and type(config.Icon) ~= "string" then
 		return self:_fail("AddGame", "Icon must be a string")
 	end
@@ -1929,6 +2121,9 @@ function Library:AddGame(config)
 		or (title:match("%w") or "?"):upper()
 	g._search = (title .. " " .. id .. " " .. g.Description):lower()
 	g._moduleState = mod and "idle" or "none"
+	g._running = false
+	local thumbId = tonumber(config.IconPlaceId) or (placeIds and placeIds[1])
+	g._thumbPlace = thumbId and math.floor(thumbId) or nil
 
 	local defs = {}
 	for _, d in ipairs(config.Features or {}) do
@@ -2051,7 +2246,7 @@ function Library:_makeContext(g, janitor)
 	}
 end
 
-function Library:_startModule(g)
+function Library:_startModule(g, onReady)
 	local mod = g.Module
 	if type(mod) ~= "table" then
 		g._moduleState = "none"
@@ -2082,11 +2277,15 @@ function Library:_startModule(g)
 			g._moduleState = "active"
 			self:_log("ok", g.Title .. " module ready")
 			self:_setStatus("ready", "READY")
+			if onReady then
+				task.spawn(onReady)
+			end
 		else
 			g._moduleState = "failed"
 			janitor:Cleanup()
 			g._janitor = nil
 			self:_log("error", g.Title .. " module failed: " .. tostring(err))
+			self:Notify({ Title = g.Title, Message = "Module failed: " .. tostring(err) })
 			self:_setStatus("error", "ERROR", 4)
 		end
 		if self._selectedId == g.Id then
@@ -2134,9 +2333,7 @@ function Library:SelectGame(id)
 	self._selectedId = id
 	if self._ui and not self._ui.dead then
 		self._ui.featOffset = 0
-	end
-	if g and g.Enabled then
-		self:_startModule(g)
+		self._ui.selectedFeature = nil
 	end
 	self:_refresh("List", "Content")
 	if g then
@@ -2158,57 +2355,64 @@ function Library:SelectGame(id)
 	return true
 end
 
-function Library:_activateFeature(g, f)
+-- RUN / STOP button. Selecting a game never starts anything; only this does.
+function Library:_runGame(g)
 	if not g.Enabled then
-		self:_log("warn", g.Title .. " is unavailable")
+		self:Notify({ Title = g.Title, Message = "This game is currently unavailable" })
 		return
 	end
-	if not f.Enabled then
-		self:_log("warn", f.Title .. " is disabled")
+	if g._running or g._moduleState == "initializing" then
 		return
 	end
-	if f._running then
-		self:_log("warn", f.Title .. " is already running")
+	if g._moduleState == "active" then -- STOP
+		self:_stopModule(g)
+		self:_setStatus("ready", "READY")
+		self:_refresh("Content")
 		return
 	end
-	if g.Module and f.RequiresModule ~= false and g._moduleState ~= "active" then
-		local why = g._moduleState == "failed" and "its module failed to initialise"
-			or "its module is not active yet"
-		self:_log("warn", f.Title .. " blocked: " .. why)
+	local hasRun = type(g.Run) == "function"
+	if not hasRun and type(g.Module) ~= "table" then
+		self:Notify({ Title = g.Title, Message = "No script is attached to this game" })
 		return
 	end
-	if type(f.Callback) ~= "function" then
-		self:_log("warn", f.Title .. " has no action attached")
-		return
-	end
-	f._running = true
-	self:_setStatus("busy", "BUSY")
-	self:_refresh("Features")
-	task.spawn(function()
-		local prev = f.State
-		if f.Toggle then
-			f.State = not f.State
+	local function execute()
+		if not hasRun then
+			return
 		end
-		local ok, err = pcall(f.Callback, f, g)
-		f._running = false
-		if ok then
-			if f.Toggle then
-				self:_log("ok", f.Title .. ": " .. (f.State and "ON" or "OFF"))
+		task.spawn(function()
+			g._running = true
+			self:_setStatus("busy", "BUSY")
+			self:_refresh("Content")
+			local ok, err = pcall(g.Run, g)
+			g._running = false
+			if ok then
+				self:_setStatus("ready", "READY")
 			else
-				self:_log("ok", f.Title .. " executed")
+				self:_log("error", g.Title .. " Run failed: " .. tostring(err))
+				self:Notify({ Title = g.Title, Message = "Run failed: " .. tostring(err) })
+				self:_setStatus("error", "ERROR", 4)
 			end
-			self:_setStatus("ready", "READY")
-		else
-			if f.Toggle then
-				f.State = prev
+			if self._selectedId == g.Id then
+				self:_refresh("Content")
 			end
-			self:_log("error", f.Title .. " failed: " .. tostring(err))
-			self:_setStatus("error", "ERROR", 4)
-		end
-		if self._selectedId == g.Id then
-			self:_refresh("Features")
-		end
-	end)
+		end)
+	end
+	if type(g.Module) == "table" then
+		self:_startModule(g, execute)
+	else
+		execute()
+	end
+	self:_refresh("Content")
+end
+
+function Library:RunGame(id)
+	local g = self:GetGame(id)
+	if not g then
+		self:_log("warn", "RunGame: unknown game '" .. tostring(id) .. "'")
+		return false
+	end
+	self:_runGame(g)
+	return true
 end
 
 -- init / destroy ------------------------------------------------------------------
@@ -2305,53 +2509,41 @@ if RUN_EXAMPLE then
 		Theme = "Monochrome",
 	})
 
+	-- Features are plain labels. Run is what the RUN button executes.
 	Library:AddGame({
 		Id = "the-bronx",
 		Title = "The Bronx",
-		Description = "Game-specific utilities. Replace the placeholder PlaceIds with real place IDs to enable current-place highlighting.",
-		PlaceIds = { 1234567890 },
+		Description = "Game-specific utilities. Replace PlaceIds with your game's place id; its thumbnail is downloaded for the icon.",
+		PlaceIds = { 920587237 }, -- example place id, replace with your own
+		Features = {
+			"Feature One",
+			"Feature Two",
+			{ Title = "Feature Three", Description = "Features can carry a description (shown on hover)" },
+		},
 		Callback = function(entry)
 			print("Selected game:", entry.Title)
 		end,
-		Features = {
-			{
-				Id = "example-feature",
-				Title = "Example Feature",
-				Description = "Demonstration feature",
-				Callback = function()
-					print("Feature activated")
-				end,
-			},
-			{
-				Id = "example-toggle",
-				Title = "Example Toggle",
-				Description = "Demonstration toggle (state is in feature.State)",
-				Toggle = true,
-				Callback = function(feature)
-					print("Toggle is now", feature.State)
-				end,
-			},
-		},
+		Run = function(entry)
+			print("Running:", entry.Title) -- start your own script here
+		end,
 	})
 
 	Library:AddGame({
 		Id = "example-game",
 		Title = "Example Game",
-		Description = "A second registered game with no features and no module.",
-		Callback = function(entry)
-			print("Selected game:", entry.Title)
-		end,
+		Description = "A second registered game with no features and no script (RUN is disabled).",
+		PlaceIds = { 4924922222 },
 	})
 
 	Library:AddGame({
 		Id = "modular-demo",
 		Title = "Modular Demo",
-		Description = "Shows the module contract: Initialize on select, Cleanup on switch or close, and a Janitor for connections.",
+		Description = "RUN calls Initialize, then Run. STOP (or switching games) calls Cleanup and releases the Janitor.",
 		Version = "0.1.0",
+		Features = { "Listed by the game module", "Another listed item" },
 		Module = {
 			Initialize = function(context)
 				context.Log("Modular Demo initialised")
-				-- anything added to the janitor is released automatically on cleanup
 				context.Janitor:Add(function()
 					print("Janitor released Modular Demo resources")
 				end)
@@ -2359,17 +2551,10 @@ if RUN_EXAMPLE then
 			Cleanup = function()
 				print("Modular Demo cleaned up")
 			end,
-			Features = {
-				{
-					Id = "ping",
-					Title = "Ping",
-					Description = "Shows a notification",
-					Callback = function()
-						Library:Notify({ Title = "Modular Demo", Message = "Pong!", Duration = 3 })
-					end,
-				},
-			},
 		},
+		Run = function()
+			Library:Notify({ Title = "Modular Demo", Message = "Started", Duration = 3 })
+		end,
 	})
 
 	Library:AddGame({
