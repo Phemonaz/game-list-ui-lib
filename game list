@@ -1,0 +1,2388 @@
+--!nocheck
+--!nolint
+--[[
+================================================================================
+ UNIVERSAL  -  GAME SCRIPT LIBRARY                                  v1.0.0
+ Single-file, Drawing-API based, black-and-white game launcher UI for Roblox.
+================================================================================
+
+ This file is a UI + registry framework. It contains NO game logic of its own:
+ every callback in the example section at the bottom is a placeholder that you
+ replace with your own code.
+
+ ENVIRONMENT REQUIREMENTS / ASSUMPTIONS
+   * Client-side (LocalScript context or a script executor).
+   * The Drawing API must exist: Drawing.new("Square") and Drawing.new("Text").
+     Standard Roblox scripts do NOT provide it. Without it Library:Init()
+     returns false and logs exactly which capability is missing.
+   * Drawing coordinates are assumed to match UserInputService:GetMouseLocation()
+     (true on executors that implement the common Drawing API).
+   * Drawing.Fonts.Monospace is used when available (needed for accurate text
+     wrapping). Other fonts work but text may be clipped/overlap slightly.
+   * Optional (feature-detected, never required): getgenv  (single-instance guard).
+   * The Drawing API cannot capture input. Clicks on the window also reach the
+     game underneath. This is a platform limitation, not a bug.
+   * Drawing has no clipping. Lists therefore scroll in whole rows.
+   * Icons are rendered as monochrome initials (Drawing "Image" is not used so
+     the UI stays strictly black-and-white and dependency-free).
+
+ PUBLIC API
+   UniversalLibrary.new(config)  -> Library
+       config: Title, Subtitle, Version, Theme ("Monochrome" | "Inverted" | table),
+               Position (Vector2), ToggleKey (Enum.KeyCode, default RightShift),
+               AutoDetect (bool, default true)  highlight game matching game.PlaceId
+               AutoSelect (bool, default false) also select the matching game on Init
+               SingleInstance (bool, default true) destroy a previous instance
+               Strict (bool, default true) invalid arguments raise errors; when
+                      false they are logged and the method returns nil, message
+               Debug (bool) mirror every log line to the output window
+   Library:SetTitle(title)            Library:SetSubtitle(subtitle)
+   Library:AddGame(config) -> game    Library:RemoveGame(id) -> bool
+   Library:GetGame(id) -> game|nil    Library:SelectGame(id|nil) -> bool
+   Library:AddFeature(gameId, feature) -> feature
+   Library:Notify(config | string)    Library:SetTheme(name | table)
+   Library:Init() -> bool, err        Library:Destroy([clearRegistry])
+   Extras: Library:SetVisible(bool), UniversalLibrary.GetCapabilities()
+
+ AddGame(config) FIELDS
+   Id           string   unique. If omitted it is generated from Title:
+                         lower-case, runs of non-alphanumerics become "-",
+                         e.g. "The Bronx!" -> "the-bronx". A duplicate id (given
+                         or generated) is rejected, never silently replaced.
+   Title        string   display name (falls back to Id).
+   Description  string   short summary.
+   PlaceIds     number | {number}   optional, used for place detection only.
+   Version      string   optional module version.
+   Enabled      bool     default true. Disabled games can be viewed but their
+                         module is not started and their features cannot run.
+   Icon         string   optional, up to 3 characters shown instead of the initial.
+   Callback     function(game)   called after the user selects the game.
+   Features     { {Id, Title, Description, Enabled, Callback, Toggle, Default} }
+   Module       { Initialize(context), Cleanup(), Features = {...}, Settings = {...} }
+   Any other keys are kept on the game table (forward compatible).
+
+ FEATURE CALLBACK
+   Callback(feature, game) runs in its own thread through pcall. For toggle
+   features (Toggle = true) feature.State already holds the NEW state when the
+   callback runs; if the callback errors the previous state is restored.
+   Set RequiresModule = false on a feature to allow it while the module is not
+   active.
+
+ MODULE CONTRACT / LIFECYCLE
+   Select an enabled game with a Module:
+     1. any previously selected game's module is cleaned up first
+     2. Initialize(context) runs in a separate thread (the UI stays responsive);
+        status shows INITIALIZING, then ACTIVE or FAILED
+     3. the game's selection Callback runs
+   Switch to another game, deselect, remove the game, or Destroy():
+     Cleanup() runs (only if Initialize succeeded), then everything added to
+     context.Janitor is released. If you switch away while Initialize is still
+     running, cleanup happens as soon as it returns.
+   context = { Library, Game, Janitor, Settings, PlaceId, Log(msg, level),
+               Notify(cfg), IsActive() }
+   context.Janitor:Add(item) / :Connect(signal, fn) accepts connections,
+   Instances, functions, threads and tables with Destroy/Disconnect, so module
+   code cannot leak connections.
+
+ LOADING / DISTRIBUTION (the registrations below never change between methods)
+   A. Local standalone: run this file as-is. The example block at the bottom
+      registers placeholder games. Set RUN_EXAMPLE = false to disable it.
+   B. ModuleScript: paste this file into a ModuleScript. It returns the library
+      table, so:  local UL = require(path.To.UniversalLibrary)
+      (set RUN_EXAMPLE = false first so requiring has no side effects).
+   C. Remote (optional, executor-dependent, NEVER required by the library):
+        local URL = "https://YOUR-HOST/universal/v1.0.0/UniversalLibrary.lua"
+        local ok, src = pcall(function() return game:HttpGet(URL) end)
+        assert(ok and type(src) == "string" and #src > 1000, "download failed")
+        local fn, err = loadstring(src, "UniversalLibrary")
+        assert(fn, err)
+        local UL = fn()
+      Integrity: only load from a host you control, pin an immutable versioned
+      URL (a commit hash or release tag, never a moving branch), and compare a
+      checksum if your executor offers a hash function. Keep this bootstrap in
+      your own entry script, separate from the library.
+
+ ADDING ANOTHER GAME
+   Library:AddGame({
+       Id = "my-game", Title = "My Game", Description = "What it does",
+       PlaceIds = { 1234567890 },
+       Callback = function(entry) print("selected", entry.Title) end,
+       Features = {
+           { Title = "Do thing", Callback = function(feature, entry) ... end },
+           { Title = "Flag", Toggle = true, Callback = function(feature) print(feature.State) end },
+       },
+   })
+   No UI code needs to change; the sidebar and detail panel update automatically.
+================================================================================
+]]
+
+local LIB_VERSION = "1.0.0"
+local RUN_EXAMPLE = true
+
+local LOG_TAG = "[Universal]"
+local ACTION_NAME = "UniversalLibrarySearchSink"
+
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local Workspace = game:GetService("Workspace")
+
+----------------------------------------------------------------------
+-- 1. UTILITIES
+----------------------------------------------------------------------
+
+local function clamp(v, lo, hi)
+	return math.max(lo, math.min(hi, v))
+end
+
+local function trim(s)
+	return (tostring(s):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function isString(v)
+	return type(v) == "string" and v:match("%S") ~= nil
+end
+
+local function slugify(s)
+	s = tostring(s):lower():gsub("[^%w]+", "-")
+	s = s:gsub("^%-+", ""):gsub("%-+$", "")
+	return s
+end
+
+local function titleCase(s)
+	return (tostring(s):gsub("(%a)([%w']*)", function(a, b)
+		return a:upper() .. b:lower()
+	end))
+end
+
+local function cleanVersion(v)
+	return (tostring(v):gsub("^[vV]", ""))
+end
+
+local function shallowCopy(t)
+	local out = {}
+	for k, v in pairs(t) do
+		out[k] = v
+	end
+	return out
+end
+
+local function ulen(s)
+	return utf8.len(s) or #s
+end
+
+local function usub(s, n)
+	if ulen(s) <= n then
+		return s
+	end
+	local ok, off = pcall(utf8.offset, s, n + 1)
+	if ok and off then
+		return s:sub(1, off - 1)
+	end
+	return s:sub(1, n)
+end
+
+local function fit(s, maxChars)
+	s = tostring(s)
+	if ulen(s) <= maxChars then
+		return s
+	end
+	return usub(s, math.max(0, maxChars - 2)) .. ".."
+end
+
+local function wrapText(str, maxChars, maxLines)
+	maxChars = math.max(4, maxChars)
+	local lines, cur = {}, ""
+	for word in tostring(str):gmatch("%S+") do
+		while ulen(word) > maxChars do
+			if cur ~= "" then
+				lines[#lines + 1] = cur
+				cur = ""
+			end
+			local part = usub(word, maxChars)
+			lines[#lines + 1] = part
+			word = word:sub(#part + 1)
+		end
+		if word ~= "" then
+			if cur == "" then
+				cur = word
+			elseif ulen(cur) + 1 + ulen(word) <= maxChars then
+				cur = cur .. " " .. word
+			else
+				lines[#lines + 1] = cur
+				cur = word
+			end
+		end
+	end
+	if cur ~= "" then
+		lines[#lines + 1] = cur
+	end
+	if #lines > maxLines then
+		for i = #lines, maxLines + 1, -1 do
+			lines[i] = nil
+		end
+		lines[maxLines] = fit(lines[maxLines] .. "..", maxChars)
+	end
+	return lines
+end
+
+local function parseColor(v)
+	local t = typeof(v)
+	if t == "Color3" then
+		return v
+	end
+	if t == "string" then
+		local hex = v:match("^#?(%x%x%x%x%x%x)$")
+		if hex then
+			return Color3.fromRGB(
+				tonumber(hex:sub(1, 2), 16),
+				tonumber(hex:sub(3, 4), 16),
+				tonumber(hex:sub(5, 6), 16)
+			)
+		end
+	end
+	return nil
+end
+
+local function viewportSize()
+	local cam = Workspace.CurrentCamera
+	if cam then
+		return cam.ViewportSize
+	end
+	return Vector2.new(1280, 720)
+end
+
+local function getEnvTable()
+	if type(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" then
+			return env
+		end
+	end
+	return nil
+end
+
+-- Janitor: releases connections / instances / functions / threads --------
+local Janitor = {}
+Janitor.__index = Janitor
+
+function Janitor.new()
+	return setmetatable({ _items = {} }, Janitor)
+end
+
+function Janitor:Add(item)
+	table.insert(self._items, item)
+	return item
+end
+
+function Janitor:Connect(signal, fn)
+	return self:Add(signal:Connect(fn))
+end
+
+function Janitor:_clean(item)
+	local t = typeof(item)
+	if t == "RBXScriptConnection" then
+		item:Disconnect()
+	elseif t == "function" then
+		item()
+	elseif t == "Instance" then
+		item:Destroy()
+	elseif t == "thread" then
+		pcall(task.cancel, item)
+	elseif t == "table" then
+		if type(item.Destroy) == "function" then
+			item:Destroy()
+		elseif type(item.Disconnect) == "function" then
+			item:Disconnect()
+		end
+	end
+end
+
+function Janitor:Cleanup()
+	local items = self._items
+	self._items = {}
+	for i = #items, 1, -1 do
+		pcall(self._clean, self, items[i])
+	end
+end
+
+----------------------------------------------------------------------
+-- 2. ENVIRONMENT / CAPABILITY DETECTION
+----------------------------------------------------------------------
+
+local function destroyDrawing(obj)
+	if obj == nil then
+		return
+	end
+	if not pcall(function()
+		obj:Remove()
+	end) then
+		pcall(function()
+			obj:Destroy()
+		end)
+	end
+end
+
+local function probeDrawing(kind)
+	local ok, obj = pcall(function()
+		return Drawing.new(kind)
+	end)
+	if not ok or obj == nil then
+		return false
+	end
+	pcall(function()
+		obj.Visible = false
+	end)
+	destroyDrawing(obj)
+	return true
+end
+
+local capsCache
+local function getCapabilities()
+	if capsCache then
+		return capsCache
+	end
+	local caps = {
+		Drawing = false,
+		Square = false,
+		Text = false,
+		Font = 3,
+		FontName = "Monospace",
+		GetEnv = getEnvTable() ~= nil,
+	}
+	local okD, D = pcall(function()
+		return Drawing
+	end)
+	if okD and D ~= nil then
+		caps.Drawing = true
+		caps.Square = probeDrawing("Square")
+		caps.Text = probeDrawing("Text")
+		local okF, f = pcall(function()
+			return Drawing.Fonts.Monospace
+		end)
+		if okF and f ~= nil then
+			caps.Font = f
+		end
+	end
+	capsCache = caps
+	return caps
+end
+
+----------------------------------------------------------------------
+-- 3. THEMES  (monochrome by default)
+----------------------------------------------------------------------
+
+local Themes = {
+	Monochrome = {
+		bg = "#0B0B0B",
+		panel = "#141414",
+		panel2 = "#1C1C1C",
+		border = "#303030",
+		text = "#F5F5F5",
+		textDim = "#999999",
+		hover = "#242424",
+		muted = "#6B6B6B",
+	},
+	Inverted = {
+		bg = "#F4F4F4",
+		panel = "#EAEAEA",
+		panel2 = "#E0E0E0",
+		border = "#C4C4C4",
+		text = "#0B0B0B",
+		textDim = "#555555",
+		hover = "#D6D6D6",
+		muted = "#8A8A8A",
+	},
+}
+
+local THEME_LOOKUP = {
+	bg = "bg", panel = "panel", panel2 = "panel2", border = "border",
+	text = "text", textdim = "textDim", hover = "hover", muted = "muted",
+}
+
+local function resolveTheme(name, overrides)
+	local out = {}
+	for k, hex in pairs(Themes[name]) do
+		out[k] = parseColor(hex)
+	end
+	for k, c in pairs(overrides or {}) do
+		out[k] = c
+	end
+	return out
+end
+
+----------------------------------------------------------------------
+-- 4. DRAWING RENDERER  (retained mode, pooled, change-only writes)
+----------------------------------------------------------------------
+
+local function newGroup(parent)
+	local g = { hidden = false, parent = parent, nodes = {}, children = {} }
+	if parent then
+		table.insert(parent.children, g)
+	end
+	return g
+end
+
+local function groupHidden(g)
+	while g do
+		if g.hidden then
+			return true
+		end
+		g = g.parent
+	end
+	return false
+end
+
+local Node = {}
+Node.__index = Node
+
+-- writes a Drawing property only when the value changed
+function Node:_prop(prop, value)
+	local cache = self.cache
+	if cache[prop] ~= value then
+		cache[prop] = value
+		self.obj[prop] = value
+	end
+end
+
+function Node:_flush()
+	local r = self.renderer
+	if r.destroyed then
+		return
+	end
+	local vis = self.shown and r.visible and not groupHidden(self.group)
+	if not vis then
+		self:_prop("Visible", false)
+		return
+	end
+	local ox = self.absolute and 0 or r.ox
+	local oy = self.absolute and 0 or r.oy
+	self:_prop("Position", Vector2.new(math.floor(ox + self.lx + 0.5), math.floor(oy + self.ly + 0.5)))
+	if self.kind == "Rect" then
+		self:_prop("Size", Vector2.new(self.w, self.h))
+	end
+	self:_prop("Visible", true)
+end
+
+function Node:Move(x, y)
+	if self.align == "right" then
+		self.ax = x
+		self.lx = x - self.renderer:TextWidth(self.text or "", self.size)
+	else
+		self.lx = x
+	end
+	self.ly = y
+	self:_flush()
+end
+
+function Node:Resize(w, h)
+	self.w, self.h = w, h
+	self:_flush()
+end
+
+function Node:Show(b)
+	if self.shown ~= b then
+		self.shown = b
+		self:_flush()
+	end
+end
+
+function Node:SetToken(tok)
+	self.token = tok
+	self:_prop("Color", self.renderer.theme[tok])
+end
+
+function Node:SetFilled(b)
+	self:_prop("Filled", b)
+end
+
+function Node:SetText(s)
+	s = tostring(s)
+	if self.text == s then
+		return
+	end
+	self.text = s
+	self:_prop("Text", s)
+	if self.align == "right" then
+		self.lx = self.ax - self.renderer:TextWidth(s, self.size)
+	end
+	self:_flush()
+end
+
+local Renderer = {}
+Renderer.__index = Renderer
+
+function Renderer.new(caps, theme)
+	return setmetatable({
+		caps = caps,
+		theme = theme,
+		nodes = {},
+		ox = 0,
+		oy = 0,
+		visible = true,
+		destroyed = false,
+		charRatio = 0.58,
+	}, Renderer)
+end
+
+-- measures the average glyph width of the chosen font once
+function Renderer:MeasureFont()
+	local ok, obj = pcall(function()
+		return Drawing.new("Text")
+	end)
+	if ok and obj then
+		pcall(function()
+			obj.Font = self.caps.Font
+			obj.Size = 20
+			obj.Text = "MMMMMMMMMMMMMMMMMMMM"
+			obj.Position = Vector2.new(-3000, -3000)
+			obj.Visible = true
+			local b = obj.TextBounds
+			if b and b.X > 0 then
+				local ratio = b.X / 20 / 20
+				if ratio >= 0.4 and ratio <= 0.8 then
+					self.charRatio = ratio
+				end
+			end
+		end)
+		destroyDrawing(obj)
+	end
+end
+
+function Renderer:TextWidth(str, size)
+	return ulen(str) * size * self.charRatio
+end
+
+function Renderer:Capacity(px, size)
+	return math.max(1, math.floor(px / (size * self.charRatio)))
+end
+
+function Renderer:_register(node, group)
+	node.renderer = self
+	node.group = group
+	node.cache = {}
+	node.shown = true
+	table.insert(self.nodes, node)
+	if group then
+		table.insert(group.nodes, node)
+	end
+	pcall(function()
+		node.obj.ZIndex = node.z
+	end)
+end
+
+function Renderer:Rect(o)
+	local node = setmetatable({
+		obj = Drawing.new("Square"),
+		kind = "Rect",
+		lx = o.x or 0,
+		ly = o.y or 0,
+		w = o.w or 0,
+		h = o.h or 0,
+		token = o.token or "panel",
+		absolute = o.absolute,
+		z = o.z or 1,
+	}, Node)
+	self:_register(node, o.group)
+	node:_prop("Filled", o.filled ~= false)
+	node:_prop("Thickness", 1)
+	node:_prop("Transparency", 1)
+	node:_prop("Color", self.theme[node.token])
+	node:_flush()
+	return node
+end
+
+function Renderer:Label(o)
+	local node = setmetatable({
+		obj = Drawing.new("Text"),
+		kind = "Text",
+		lx = o.x or 0,
+		ly = o.y or 0,
+		ax = o.x or 0,
+		size = o.size or 12,
+		align = o.align or "left",
+		token = o.token or "text",
+		absolute = o.absolute,
+		z = o.z or 5,
+	}, Node)
+	self:_register(node, o.group)
+	node:_prop("Font", self.caps.Font)
+	node:_prop("Size", node.size)
+	node:_prop("Outline", false)
+	node:_prop("Center", node.align == "center")
+	node:_prop("Transparency", 1)
+	node:_prop("Color", self.theme[node.token])
+	node:SetText(o.text or "")
+	return node
+end
+
+function Renderer:SetOrigin(x, y)
+	x, y = math.floor(x), math.floor(y)
+	if x == self.ox and y == self.oy then
+		return
+	end
+	self.ox, self.oy = x, y
+	for _, n in ipairs(self.nodes) do
+		n:_flush()
+	end
+end
+
+function Renderer:SetVisible(b)
+	if self.visible == b then
+		return
+	end
+	self.visible = b
+	for _, n in ipairs(self.nodes) do
+		n:_flush()
+	end
+end
+
+function Renderer:SetGroupHidden(g, hidden)
+	if g.hidden == hidden then
+		return
+	end
+	g.hidden = hidden
+	local function walk(grp)
+		for _, n in ipairs(grp.nodes) do
+			n:_flush()
+		end
+		for _, c in ipairs(grp.children) do
+			walk(c)
+		end
+	end
+	walk(g)
+end
+
+function Renderer:ApplyTheme(theme)
+	self.theme = theme
+	for _, n in ipairs(self.nodes) do
+		n:_prop("Color", theme[n.token])
+	end
+end
+
+function Renderer:Destroy()
+	if self.destroyed then
+		return
+	end
+	self.destroyed = true
+	for _, n in ipairs(self.nodes) do
+		destroyDrawing(n.obj)
+	end
+	self.nodes = {}
+end
+
+----------------------------------------------------------------------
+-- 5. UI: LAYOUT, COMPONENTS, INPUT
+----------------------------------------------------------------------
+
+local L = {
+	W = 680, H = 460,
+	HEADER = 46, SIDEBAR = 230, PAD = 16,
+	ROW_H = 40, FEAT_H = 40, FEAT_GAP = 4,
+	LOG_H = 92, TOAST_W = 260, TOAST_H = 46,
+	MAX_LOGS = 80,
+}
+
+local LEVEL_MARK = { info = "-", ok = "+", warn = "!", error = "x" }
+
+local DIGITS = {
+	Zero = "0", One = "1", Two = "2", Three = "3", Four = "4",
+	Five = "5", Six = "6", Seven = "7", Eight = "8", Nine = "9",
+}
+
+local SEARCH_KEYS = {}
+for c in ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):gmatch(".") do
+	table.insert(SEARCH_KEYS, Enum.KeyCode[c])
+end
+for name in pairs(DIGITS) do
+	table.insert(SEARCH_KEYS, Enum.KeyCode[name])
+end
+for _, name in ipairs({ "Space", "Backspace", "Return", "Escape", "Minus", "Period" }) do
+	table.insert(SEARCH_KEYS, Enum.KeyCode[name])
+end
+
+local function keyToChar(kc, shift)
+	if kc == Enum.KeyCode.Space then
+		return " "
+	elseif kc == Enum.KeyCode.Minus then
+		return shift and "_" or "-"
+	elseif kc == Enum.KeyCode.Period then
+		return "."
+	end
+	local name = kc.Name
+	if #name == 1 and name:match("%a") then
+		return shift and name:upper() or name:lower()
+	end
+	return DIGITS[name]
+end
+
+local UI = {}
+UI.__index = UI
+
+function UI.new(lib, caps)
+	local self = setmetatable({}, UI)
+	self.lib, self.caps = lib, caps
+	self.janitor = Janitor.new()
+	self.regions, self.slots, self.featSlots, self.toastSlots = {}, {}, {}, {}
+	self.descLines, self.logLines, self.cards = {}, {}, {}
+	self.welcomeLines = {}
+	self.listOffset, self.featOffset = 0, 0
+	self.tipToken, self.filterToken = 0, 0
+	self.minimized, self.focused, self.dead = false, false, false
+	self.r = Renderer.new(caps, lib._theme)
+	self.r:MeasureFont()
+	local vp = viewportSize()
+	local pos = lib._position
+	local x = pos and pos.X or (vp.X - L.W) / 2
+	local y = pos and pos.Y or (vp.Y - L.H) / 2
+	self.r.ox = clamp(math.floor(x), 0, math.max(0, vp.X - L.W))
+	self.r.oy = clamp(math.floor(y), 0, math.max(0, vp.Y - L.H))
+	return self
+end
+
+-- Regions: input hit-boxes in window-local coordinates -------------------
+function UI:AddRegion(o)
+	local reg = {
+		id = o.id, x = o.x, y = o.y, w = o.w, h = o.h, group = o.group,
+		z = o.z or 1, on = o.on ~= false, drag = o.drag,
+		onClick = o.onClick, onEnter = o.onEnter, onLeave = o.onLeave,
+		onScroll = o.onScroll, tooltip = o.tooltip,
+	}
+	table.insert(self.regions, reg)
+	return reg
+end
+
+function UI:RegionAt(px, py, pred)
+	if not self.r.visible then
+		return nil
+	end
+	local lx, ly = px - self.r.ox, py - self.r.oy
+	local best
+	for _, g in ipairs(self.regions) do
+		if g.on and lx >= g.x and lx < g.x + g.w and ly >= g.y and ly < g.y + g.h
+			and (not pred or pred(g)) and not groupHidden(g.group) then
+			if not best or g.z >= best.z then
+				best = g
+			end
+		end
+	end
+	return best
+end
+
+function UI:SetHover(reg)
+	if reg == self.hover then
+		return
+	end
+	local old = self.hover
+	self.hover = reg
+	if old and old.onLeave then
+		old.onLeave()
+	end
+	if reg and reg.onEnter then
+		reg.onEnter()
+	end
+	self:UpdateTooltip()
+end
+
+function UI:ReHover()
+	if self.dead or self.drag then
+		return
+	end
+	local m = UserInputService:GetMouseLocation()
+	self:SetHover(self:RegionAt(m.X, m.Y))
+end
+
+-- Button component -------------------------------------------------------
+function UI:Button(o)
+	local r = self.r
+	local size = o.size or 11
+	local b = { enabled = true, hover = false, active = false }
+	b.bg = r:Rect({ x = o.x, y = o.y, w = o.w, h = o.h, token = "panel2", group = o.group, z = o.z })
+	b.border = r:Rect({ x = o.x, y = o.y, w = o.w, h = o.h, filled = false, token = "border", group = o.group, z = o.z + 1 })
+	b.label = r:Label({
+		x = o.x + o.w / 2, y = o.y + math.floor((o.h - size) / 2) - 1, size = size,
+		align = "center", token = "text", group = o.group, z = o.z + 2, text = o.text or "",
+	})
+	b.region = self:AddRegion({
+		x = o.x, y = o.y, w = o.w, h = o.h, group = o.group, z = o.z, tooltip = o.tooltip,
+		onClick = function()
+			if b.enabled and o.onClick then
+				o.onClick(b)
+			end
+		end,
+		onEnter = function()
+			b.hover = true
+			b:Refresh()
+		end,
+		onLeave = function()
+			b.hover = false
+			b:Refresh()
+		end,
+	})
+	function b:Refresh()
+		local hot = self.hover and self.enabled
+		if self.active then
+			self.bg:SetToken("text")
+			self.border:SetToken("text")
+			self.label:SetToken("bg")
+		else
+			self.bg:SetToken(hot and "hover" or "panel2")
+			self.border:SetToken(hot and "textDim" or "border")
+			self.label:SetToken(self.enabled and "text" or "muted")
+		end
+	end
+	function b:SetText(s)
+		self.label:SetText(s)
+	end
+	function b:SetEnabled(e)
+		self.enabled = e
+		self:Refresh()
+	end
+	function b:SetActive(a)
+		self.active = a
+		self:Refresh()
+	end
+	function b:Show(s)
+		self.bg:Show(s)
+		self.border:Show(s)
+		self.label:Show(s)
+		self.region.on = s
+	end
+	return b
+end
+
+-- Build -------------------------------------------------------------------
+function UI:Build()
+	local r, lib = self.r, self.lib
+	local W, H, HEADER, SB = L.W, L.H, L.HEADER, L.SIDEBAR
+	local cx = SB + 1 + L.PAD
+	local cw = W - cx - L.PAD
+	self.cx, self.cw = cx, cw
+
+	local gHeader, gBody = newGroup(nil), newGroup(nil)
+	local gWelcome, gGame = newGroup(gBody), newGroup(gBody)
+	gGame.hidden = true
+	local gTip = newGroup(nil)
+	gTip.hidden = true
+	self.groups = { header = gHeader, body = gBody, welcome = gWelcome, game = gGame, tip = gTip }
+
+	-- window frame -------------------------------------------------------
+	self.frameBg = r:Rect({ w = W, h = H, token = "bg", z = 1 })
+	self.frameBorder = r:Rect({ w = W, h = H, filled = false, token = "border", z = 12 })
+
+	-- header -------------------------------------------------------------
+	r:Rect({ w = W, h = HEADER, token = "panel", group = gHeader, z = 2 })
+	r:Rect({ y = HEADER - 1, w = W, h = 1, token = "border", group = gHeader, z = 3 })
+	self.titleLbl = r:Label({ x = 14, y = 8, size = 14, token = "text", group = gHeader, z = 6 })
+	self.versionLbl = r:Label({ x = 100, y = 11, size = 10, token = "muted", group = gHeader, z = 6 })
+	self.subtitleLbl = r:Label({ x = 14, y = 27, size = 10, token = "textDim", group = gHeader, z = 6 })
+	self.statusAnchor = W - 62 - 16
+	self.statusDot = r:Rect({ x = 0, y = 20, w = 6, h = 6, token = "text", group = gHeader, z = 6 })
+	self.statusLbl = r:Label({ x = self.statusAnchor, y = 16, size = 10, align = "right", token = "text", group = gHeader, z = 6 })
+	self.btnMin = self:Button({
+		x = W - 62, y = 11, w = 24, h = 24, text = "-", group = gHeader, z = 6,
+		onClick = function() self:ToggleMinimize() end,
+		tooltip = function() return self.minimized and "Restore" or "Minimize" end,
+	})
+	self.btnClose = self:Button({
+		x = W - 34, y = 11, w = 24, h = 24, text = "x", group = gHeader, z = 6,
+		onClick = function() lib:Destroy() end, tooltip = "Close",
+	})
+	self:AddRegion({ id = "drag", x = 0, y = 0, w = W, h = HEADER, group = gHeader, z = 1, drag = true })
+
+	-- sidebar ------------------------------------------------------------
+	r:Rect({ y = HEADER, w = SB, h = H - HEADER, token = "panel", group = gBody, z = 2 })
+	r:Rect({ x = SB, y = HEADER, w = 1, h = H - HEADER, token = "border", group = gBody, z = 3 })
+	r:Label({ x = 14, y = HEADER + 14, size = 11, text = "GAMES", token = "text", group = gBody, z = 6 })
+	self.countLbl = r:Label({ x = SB - 14, y = HEADER + 15, size = 10, align = "right", token = "textDim", group = gBody, z = 6 })
+
+	local sy = HEADER + 38
+	local sw = SB - 20
+	self.searchBg = r:Rect({ x = 10, y = sy, w = sw, h = 28, token = "panel2", group = gBody, z = 3 })
+	self.searchBorder = r:Rect({ x = 10, y = sy, w = sw, h = 28, filled = false, token = "border", group = gBody, z = 4 })
+	self.searchLbl = r:Label({ x = 20, y = sy + 8, size = 12, token = "muted", group = gBody, z = 6 })
+	self.searchChars = r:Capacity(sw - 20, 12)
+	self:AddRegion({ id = "search", x = 10, y = sy, w = sw, h = 28, group = gBody, z = 3, tooltip = "Click to type; Esc clears" })
+
+	local listY = HEADER + 76
+	local slotCount = math.max(1, math.floor((H - 10 - listY) / L.ROW_H))
+	self.listY, self.listH = listY, slotCount * L.ROW_H
+	local rowW = SB - 22
+	local textPx = (SB - 28) - 54 - 6
+	self.rowTitleChars, self.rowDescChars = r:Capacity(textPx, 13), r:Capacity(textPx, 10)
+	for i = 1, slotCount do
+		local y = listY + (i - 1) * L.ROW_H
+		local slot = { hover = false }
+		slot.bg = r:Rect({ x = 6, y = y, w = rowW, h = L.ROW_H - 2, token = "panel", group = gBody, z = 3 })
+		slot.bar = r:Rect({ x = 6, y = y + 6, w = 2, h = L.ROW_H - 14, token = "panel", group = gBody, z = 5 })
+		slot.box = r:Rect({ x = 16, y = y + 5, w = 28, h = 28, filled = false, token = "border", group = gBody, z = 5 })
+		slot.initial = r:Label({ x = 30, y = y + 11, size = 13, align = "center", token = "textDim", group = gBody, z = 6 })
+		slot.title = r:Label({ x = 54, y = y + 6, size = 13, token = "text", group = gBody, z = 6 })
+		slot.desc = r:Label({ x = 54, y = y + 22, size = 10, token = "muted", group = gBody, z = 6 })
+		slot.dot = r:Rect({ x = SB - 28, y = y + 16, w = 5, h = 5, token = "textDim", group = gBody, z = 6 })
+		slot.nodes = { slot.bg, slot.bar, slot.box, slot.initial, slot.title, slot.desc, slot.dot }
+		slot.region = self:AddRegion({
+			x = 6, y = y, w = rowW, h = L.ROW_H - 2, group = gBody, z = 4, on = false,
+			onClick = function()
+				if slot.id then
+					lib:SelectGame(slot.id)
+				end
+			end,
+			onEnter = function()
+				slot.hover = true
+				self:RefreshSlotVisual(slot)
+			end,
+			onLeave = function()
+				slot.hover = false
+				self:RefreshSlotVisual(slot)
+			end,
+			tooltip = function()
+				local g = slot.id and lib._games[slot.id]
+				if not g then
+					return nil
+				end
+				if lib._matchedId == g.Id then
+					return g.Title .. " - matches the current place"
+				end
+				return g.Title .. (g.Enabled and " - available" or " - unavailable")
+			end,
+		})
+		self.slots[i] = slot
+	end
+	self.listTrack = r:Rect({ x = SB - 9, y = listY, w = 3, h = self.listH, token = "border", group = gBody, z = 3 })
+	self.listThumb = r:Rect({ x = SB - 9, y = listY, w = 3, h = 20, token = "textDim", group = gBody, z = 4 })
+	self.listEmpty = r:Label({ x = SB / 2, y = listY + 18, size = 11, align = "center", token = "muted", group = gBody, z = 6 })
+	self:AddRegion({
+		x = 0, y = listY, w = SB, h = self.listH, group = gBody, z = 2,
+		onScroll = function(d)
+			self.listOffset = self.listOffset + d
+			self:RefreshList()
+		end,
+	})
+
+	-- welcome view -------------------------------------------------------
+	local top = HEADER + 16
+	self.welcomeTitle = r:Label({ x = cx, y = top + 8, size = 20, token = "text", group = gWelcome, z = 6 })
+	self.welcomeChars = r:Capacity(cw, 12)
+	for i = 1, 2 do
+		self.welcomeLines[i] = r:Label({ x = cx, y = top + 44 + (i - 1) * 16, size = 12, token = "textDim", group = gWelcome, z = 6 })
+	end
+	local cardW = math.floor((cw - 16) / 3)
+	for i = 1, 3 do
+		local x = cx + (i - 1) * (cardW + 8)
+		local y = top + 96
+		local card = {}
+		card.bg = r:Rect({ x = x, y = y, w = cardW, h = 58, token = "panel", group = gWelcome, z = 3 })
+		card.border = r:Rect({ x = x, y = y, w = cardW, h = 58, filled = false, token = "border", group = gWelcome, z = 4 })
+		card.label = r:Label({ x = x + 12, y = y + 10, size = 10, token = "textDim", group = gWelcome, z = 6 })
+		card.value = r:Label({ x = x + 12, y = y + 28, size = 18, token = "text", group = gWelcome, z = 6 })
+		self.cards[i] = card
+	end
+	self.placeHint = r:Label({ x = cx, y = top + 170, size = 11, token = "textDim", group = gWelcome, z = 6 })
+
+	-- game view ----------------------------------------------------------
+	self.gameBox = r:Rect({ x = cx, y = top, w = 40, h = 40, filled = false, token = "text", group = gGame, z = 5 })
+	self.gameInitial = r:Label({ x = cx + 20, y = top + 11, size = 18, align = "center", token = "text", group = gGame, z = 6 })
+	self.gameTitleChars = r:Capacity(cw - 54, 18)
+	self.gameTitle = r:Label({ x = cx + 54, y = top + 1, size = 18, token = "text", group = gGame, z = 6 })
+	self.infoChars = r:Capacity(cw - 54, 10)
+	self.gameInfo = r:Label({ x = cx + 54, y = top + 26, size = 10, token = "textDim", group = gGame, z = 6 })
+	self.descChars = r:Capacity(cw, 12)
+	for i = 1, 3 do
+		self.descLines[i] = r:Label({ x = cx, y = top + 52 + (i - 1) * 15, size = 12, token = "textDim", group = gGame, z = 6 })
+	end
+	r:Label({ x = cx, y = top + 110, size = 10, text = "FEATURES", token = "text", group = gGame, z = 6 })
+	self.featCountLbl = r:Label({ x = cx + cw, y = top + 110, size = 10, align = "right", token = "textDim", group = gGame, z = 6 })
+	r:Rect({ x = cx, y = top + 126, w = cw, h = 1, token = "border", group = gGame, z = 3 })
+
+	local listTop = top + 134
+	local logTop = H - L.LOG_H - 12
+	local avail = logTop - 10 - listTop
+	local fn = math.max(1, math.floor((avail + L.FEAT_GAP) / (L.FEAT_H + L.FEAT_GAP)))
+	self.featListTop = listTop
+	self.featListH = fn * (L.FEAT_H + L.FEAT_GAP) - L.FEAT_GAP
+	local btnW = 60
+	local textPx2 = cw - 12 - btnW - 8 - 12
+	self.featTitleChars, self.featDescChars = r:Capacity(textPx2, 12), r:Capacity(textPx2, 10)
+	for i = 1, fn do
+		local y = listTop + (i - 1) * (L.FEAT_H + L.FEAT_GAP)
+		local slot = {}
+		slot.bg = r:Rect({ x = cx, y = y, w = cw, h = L.FEAT_H, token = "panel", group = gGame, z = 3 })
+		slot.border = r:Rect({ x = cx, y = y, w = cw, h = L.FEAT_H, filled = false, token = "border", group = gGame, z = 4 })
+		slot.title = r:Label({ x = cx + 12, y = y + 6, size = 12, token = "text", group = gGame, z = 6 })
+		slot.desc = r:Label({ x = cx + 12, y = y + 23, size = 10, token = "textDim", group = gGame, z = 6 })
+		slot.nodes = { slot.bg, slot.border, slot.title, slot.desc }
+		slot.btn = self:Button({
+			x = cx + cw - btnW - 8, y = y + 8, w = btnW, h = 24, text = "RUN", group = gGame, z = 7,
+			onClick = function()
+				local g = lib._games[lib._selectedId]
+				if g and slot.feature then
+					lib:_activateFeature(g, slot.feature)
+				end
+			end,
+			tooltip = function()
+				local f = slot.feature
+				return f and (f.Description or f.Title) or nil
+			end,
+		})
+		self.featSlots[i] = slot
+	end
+	self.featTrack = r:Rect({ x = W - 10, y = listTop, w = 3, h = self.featListH, token = "border", group = gGame, z = 3 })
+	self.featThumb = r:Rect({ x = W - 10, y = listTop, w = 3, h = 20, token = "textDim", group = gGame, z = 4 })
+	self.featEmpty = r:Label({ x = cx + cw / 2, y = listTop + 16, size = 11, align = "center", token = "muted", group = gGame, z = 6 })
+	self:AddRegion({
+		x = cx, y = listTop, w = cw, h = self.featListH, group = gGame, z = 2,
+		onScroll = function(d)
+			self.featOffset = self.featOffset + d
+			self:RefreshFeatures()
+		end,
+	})
+
+	-- log panel ----------------------------------------------------------
+	r:Rect({ x = cx, y = logTop, w = cw, h = L.LOG_H, token = "panel", group = gBody, z = 3 })
+	r:Rect({ x = cx, y = logTop, w = cw, h = L.LOG_H, filled = false, token = "border", group = gBody, z = 4 })
+	r:Label({ x = cx + 10, y = logTop + 7, size = 10, text = "LOG", token = "textDim", group = gBody, z = 6 })
+	self.logChars = r:Capacity(cw - 20, 10)
+	for i = 1, 5 do
+		self.logLines[i] = r:Label({ x = cx + 10, y = logTop + 22 + (i - 1) * 13, size = 10, token = "textDim", group = gBody, z = 6 })
+	end
+
+	-- toasts -------------------------------------------------------------
+	self.toastChars = r:Capacity(L.TOAST_W - 24, 10)
+	for i = 1, 3 do
+		local grp = newGroup(nil)
+		grp.hidden = true
+		local x = W - 16 - L.TOAST_W
+		local y = HEADER + 10 + (i - 1) * (L.TOAST_H + 6)
+		local slot = { group = grp, token = 0, active = false }
+		slot.bg = r:Rect({ x = x, y = y, w = L.TOAST_W, h = L.TOAST_H, token = "panel2", group = grp, z = 20 })
+		slot.border = r:Rect({ x = x, y = y, w = L.TOAST_W, h = L.TOAST_H, filled = false, token = "textDim", group = grp, z = 21 })
+		slot.title = r:Label({ x = x + 12, y = y + 8, size = 12, token = "text", group = grp, z = 22 })
+		slot.msg = r:Label({ x = x + 12, y = y + 26, size = 10, token = "textDim", group = grp, z = 22 })
+		slot.region = self:AddRegion({
+			x = x, y = y, w = L.TOAST_W, h = L.TOAST_H, group = grp, z = 20,
+			onClick = function() self:DismissToast(slot) end,
+		})
+		self.toastSlots[i] = slot
+	end
+
+	-- tooltip (absolute screen coordinates) ------------------------------
+	self.tipBg = r:Rect({ w = 10, h = 22, token = "panel2", absolute = true, group = gTip, z = 40 })
+	self.tipBorder = r:Rect({ w = 10, h = 22, filled = false, token = "textDim", absolute = true, group = gTip, z = 41 })
+	self.tipLbl = r:Label({ size = 11, token = "text", absolute = true, group = gTip, z = 42 })
+end
+
+-- Input -------------------------------------------------------------------
+local function guarded(ui, fn)
+	return function(...)
+		local ok, err = pcall(fn, ...)
+		if not ok and not ui.dead then
+			ui.lib:_log("error", "UI: " .. tostring(err))
+		end
+	end
+end
+
+function UI:Bind()
+	local j = self.janitor
+	j:Connect(UserInputService.InputBegan, guarded(self, function(input, processed)
+		self:OnInputBegan(input, processed)
+	end))
+	j:Connect(UserInputService.InputEnded, guarded(self, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			self.drag = nil
+		end
+	end))
+	j:Connect(UserInputService.InputChanged, guarded(self, function(input)
+		self:OnInputChanged(input)
+	end))
+	local cam = Workspace.CurrentCamera
+	if cam then
+		j:Connect(cam:GetPropertyChangedSignal("ViewportSize"), guarded(self, function()
+			self:ClampWindow()
+		end))
+	end
+	self._keyHandler = guarded(self, function(_, state, input)
+		if state == Enum.UserInputState.Begin then
+			self:OnKey(input)
+		end
+	end)
+end
+
+function UI:OnInputBegan(input, processed)
+	if self.dead then
+		return
+	end
+	local t = input.UserInputType
+	if t == Enum.UserInputType.MouseButton1 then
+		local m = UserInputService:GetMouseLocation()
+		local reg = self:RegionAt(m.X, m.Y)
+		self:HideTooltip()
+		self:SetFocus(reg ~= nil and reg.id == "search")
+		if reg then
+			if reg.drag then
+				self.drag = { dx = m.X - self.r.ox, dy = m.Y - self.r.oy }
+			elseif reg.onClick then
+				reg.onClick()
+			end
+		end
+	elseif t == Enum.UserInputType.Keyboard and not processed and not self.focused
+		and input.KeyCode == self.lib._toggleKey then
+		self:SetVisible(not self.r.visible)
+	end
+end
+
+function UI:OnInputChanged(input)
+	if self.dead then
+		return
+	end
+	local t = input.UserInputType
+	if t == Enum.UserInputType.MouseMovement then
+		local m = UserInputService:GetMouseLocation()
+		if self.drag then
+			local vp = viewportSize()
+			local h = self.minimized and L.HEADER or L.H
+			self.r:SetOrigin(
+				clamp(m.X - self.drag.dx, 0, math.max(0, vp.X - L.W)),
+				clamp(m.Y - self.drag.dy, 0, math.max(0, vp.Y - h))
+			)
+		else
+			self:SetHover(self:RegionAt(m.X, m.Y))
+		end
+	elseif t == Enum.UserInputType.MouseWheel then
+		local m = UserInputService:GetMouseLocation()
+		local reg = self:RegionAt(m.X, m.Y, function(g)
+			return g.onScroll ~= nil
+		end)
+		if reg then
+			reg.onScroll(input.Position.Z > 0 and -1 or 1)
+		end
+	end
+end
+
+-- Search field ---------------------------------------------------------------
+function UI:SetFocus(b)
+	if self.focused == b then
+		return
+	end
+	self.focused = b
+	if b then
+		pcall(function()
+			ContextActionService:BindActionAtPriority(
+				ACTION_NAME,
+				function(...)
+					self._keyHandler(...)
+					return Enum.ContextActionResult.Sink
+				end,
+				false, 3000, table.unpack(SEARCH_KEYS)
+			)
+		end)
+	else
+		pcall(function()
+			ContextActionService:UnbindAction(ACTION_NAME)
+		end)
+	end
+	if not self.dead then
+		self:RefreshSearch()
+	end
+end
+
+function UI:OnKey(input)
+	local lib = self.lib
+	local kc = input.KeyCode
+	if kc == Enum.KeyCode.Escape then
+		if lib._query ~= "" then
+			self:SetQuery("")
+		else
+			self:SetFocus(false)
+		end
+	elseif kc == Enum.KeyCode.Return then
+		self:SetFocus(false)
+	elseif kc == Enum.KeyCode.Backspace then
+		if #lib._query > 0 then
+			self:SetQuery(lib._query:sub(1, -2))
+		end
+	else
+		local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+		local ch = keyToChar(kc, shift)
+		if ch and #lib._query < 32 then
+			self:SetQuery(lib._query .. ch)
+		end
+	end
+end
+
+function UI:SetQuery(q)
+	self.lib._query = q
+	self:RefreshSearch()
+	self.filterToken = self.filterToken + 1
+	local token = self.filterToken
+	task.delay(0.12, function() -- debounce
+		if self.dead or self.filterToken ~= token then
+			return
+		end
+		self.lib:_rebuildFilter()
+		self.listOffset = 0
+		self:RefreshList()
+	end)
+end
+
+-- Window management ----------------------------------------------------------
+function UI:ClampWindow()
+	if self.dead then
+		return
+	end
+	local vp = viewportSize()
+	local h = self.minimized and L.HEADER or L.H
+	self.r:SetOrigin(
+		clamp(self.r.ox, 0, math.max(0, vp.X - L.W)),
+		clamp(self.r.oy, 0, math.max(0, vp.Y - h))
+	)
+end
+
+function UI:ToggleMinimize()
+	self.minimized = not self.minimized
+	self:SetFocus(false)
+	self:HideTooltip()
+	self.r:SetGroupHidden(self.groups.body, self.minimized)
+	local h = self.minimized and L.HEADER or L.H
+	self.frameBg:Resize(L.W, h)
+	self.frameBorder:Resize(L.W, h)
+	self.btnMin:SetText(self.minimized and "+" or "-")
+	self:ClampWindow()
+	self:ReHover()
+end
+
+function UI:SetVisible(b)
+	if not b then
+		self:SetFocus(false)
+		self:HideTooltip()
+		self.drag = nil
+	end
+	self.r:SetVisible(b)
+	if b then
+		self:ReHover()
+	end
+end
+
+function UI:Show()
+	self:SetVisible(true)
+	if self.minimized then
+		self:ToggleMinimize()
+	end
+end
+
+-- Tooltip ----------------------------------------------------------------------
+function UI:HideTooltip()
+	self.tipToken = self.tipToken + 1
+	if not self.dead then
+		self.r:SetGroupHidden(self.groups.tip, true)
+	end
+end
+
+function UI:UpdateTooltip()
+	self:HideTooltip()
+	local token = self.tipToken
+	local reg = self.hover
+	if not reg or not reg.tooltip then
+		return
+	end
+	task.delay(0.45, function()
+		if self.dead or self.tipToken ~= token or self.hover ~= reg or self.drag then
+			return
+		end
+		local tip = reg.tooltip
+		if type(tip) == "function" then
+			tip = tip()
+		end
+		if type(tip) == "string" and tip ~= "" then
+			self:ShowTooltip(tip)
+		end
+	end)
+end
+
+function UI:ShowTooltip(text)
+	local r = self.r
+	local m = UserInputService:GetMouseLocation()
+	local vp = viewportSize()
+	local w = r:TextWidth(text, 11) + 16
+	local x = clamp(m.X + 14, 0, math.max(0, vp.X - w))
+	local y = clamp(m.Y + 20, 0, math.max(0, vp.Y - 22))
+	self.tipBg:Resize(w, 22)
+	self.tipBorder:Resize(w, 22)
+	self.tipBg:Move(x, y)
+	self.tipBorder:Move(x, y)
+	self.tipLbl:SetText(text)
+	self.tipLbl:Move(x + 8, y + 5)
+	r:SetGroupHidden(self.groups.tip, false)
+end
+
+-- Toasts -------------------------------------------------------------------------
+function UI:PumpToasts()
+	local q = self.lib._toastQueue
+	for _, slot in ipairs(self.toastSlots) do
+		if #q == 0 then
+			break
+		end
+		if not slot.active then
+			self:ShowToast(slot, table.remove(q, 1))
+		end
+	end
+end
+
+function UI:ShowToast(slot, item)
+	slot.active = true
+	slot.token = slot.token + 1
+	local token = slot.token
+	slot.title:SetText(fit(item.title, self.toastChars))
+	slot.msg:SetText(fit(item.message, self.toastChars + 4))
+	self.r:SetGroupHidden(slot.group, false)
+	task.delay(item.duration, function()
+		if not self.dead and slot.token == token then
+			self:DismissToast(slot)
+		end
+	end)
+end
+
+function UI:DismissToast(slot)
+	if not slot.active then
+		return
+	end
+	slot.active = false
+	slot.token = slot.token + 1
+	self.r:SetGroupHidden(slot.group, true)
+	self:PumpToasts()
+	self:ReHover()
+end
+
+-- Refresh (data -> drawing properties, change-only writes) -----------------------
+function UI:RefreshHeader()
+	local lib, r = self.lib, self.r
+	local title = fit(lib._title, 40)
+	self.titleLbl:SetText(title)
+	self.subtitleLbl:SetText(fit(lib._subtitle, 60))
+	self.versionLbl:SetText("v" .. cleanVersion(lib._version))
+	self.versionLbl:Move(14 + r:TextWidth(title, 14) + 8, 11)
+	self:RefreshStatus()
+	self.btnMin:SetText(self.minimized and "+" or "-")
+end
+
+function UI:RefreshStatus()
+	local st = self.lib._status
+	local text = fit(string.upper(st.text), 12)
+	self.statusLbl:SetText(text)
+	self.statusDot:Move(self.statusAnchor - self.r:TextWidth(text, 10) - 12, 20)
+	local tok = st.kind == "busy" and "textDim" or "text"
+	self.statusDot:SetFilled(st.kind ~= "error")
+	self.statusDot:SetToken(tok)
+	self.statusLbl:SetToken(tok)
+end
+
+function UI:RefreshSearch()
+	local q = self.lib._query
+	if q == "" and not self.focused then
+		self.searchLbl:SetText("Search games...")
+		self.searchLbl:SetToken("muted")
+	else
+		self.searchLbl:SetText(fit(q .. (self.focused and "|" or ""), self.searchChars))
+		self.searchLbl:SetToken("text")
+	end
+	self.searchBorder:SetToken(self.focused and "textDim" or "border")
+end
+
+function UI:SetSlotShown(slot, b)
+	for _, n in ipairs(slot.nodes) do
+		n:Show(b)
+	end
+	slot.region.on = b
+end
+
+function UI:RefreshSlotVisual(slot)
+	local lib = self.lib
+	local g = slot.id and lib._games[slot.id]
+	if not g then
+		return
+	end
+	local selected = lib._selectedId == g.Id
+	local hover = slot.hover
+	local bgTok = selected and "panel2" or (hover and "hover" or "panel")
+	slot.bg:SetToken(bgTok)
+	slot.bar:SetToken(selected and "text" or bgTok)
+	slot.box:SetToken(selected and "text" or "border")
+	slot.initial:SetToken(selected and "text" or "textDim")
+	local titleTok = (selected or hover) and "text" or "textDim"
+	if not g.Enabled then
+		titleTok = "muted"
+	end
+	slot.title:SetToken(titleTok)
+	slot.desc:SetToken(selected and "textDim" or "muted")
+	if lib._matchedId == g.Id then
+		slot.dot:SetFilled(true)
+		slot.dot:SetToken("text")
+	elseif g.Enabled then
+		slot.dot:SetFilled(true)
+		slot.dot:SetToken("textDim")
+	else
+		slot.dot:SetFilled(false)
+		slot.dot:SetToken("muted")
+	end
+end
+
+local function updateScrollbar(track, thumb, top, height, offset, total, visible)
+	if total <= visible then
+		track:Show(false)
+		thumb:Show(false)
+		return
+	end
+	local th = math.max(16, math.floor(height * visible / total))
+	local maxOff = total - visible
+	local ty = top + math.floor((height - th) * (offset / maxOff))
+	track:Show(true)
+	thumb:Show(true)
+	thumb:Resize(3, th)
+	thumb:Move(thumb.lx, ty)
+end
+
+function UI:RefreshList()
+	local lib = self.lib
+	local list = lib._filtered
+	local n = #self.slots
+	local maxOff = math.max(0, #list - n)
+	self.listOffset = clamp(self.listOffset, 0, maxOff)
+	for i, slot in ipairs(self.slots) do
+		local id = list[self.listOffset + i]
+		local g = id and lib._games[id]
+		if g then
+			slot.id = g.Id
+			slot.initial:SetText(g._initial)
+			slot.title:SetText(fit(g.Title, self.rowTitleChars))
+			slot.desc:SetText(fit(g.Description or "", self.rowDescChars))
+			self:SetSlotShown(slot, true)
+			self:RefreshSlotVisual(slot)
+		else
+			slot.id = nil
+			slot.hover = false
+			self:SetSlotShown(slot, false)
+		end
+	end
+	self.countLbl:SetText(#lib._order == #list and tostring(#list) or (#list .. "/" .. #lib._order))
+	updateScrollbar(self.listTrack, self.listThumb, self.listY, self.listH, self.listOffset, #list, n)
+	if #list == 0 then
+		self.listEmpty:SetText(#lib._order == 0 and "No games registered" or "No results")
+		self.listEmpty:Show(true)
+	else
+		self.listEmpty:Show(false)
+	end
+	self:ReHover()
+end
+
+function UI:RefreshWelcome()
+	local lib = self.lib
+	self.welcomeTitle:SetText("Welcome to " .. fit(titleCase(lib._title), 24))
+	local lines = wrapText("Select a game from the library to explore its information and available features.", self.welcomeChars, 2)
+	for i, node in ipairs(self.welcomeLines) do
+		node:SetText(lines[i] or "")
+	end
+	local modules = 0
+	for _, g in pairs(lib._games) do
+		if g.Module and g.Enabled then
+			modules = modules + 1
+		end
+	end
+	local data = {
+		{ "GAMES", tostring(#lib._order) },
+		{ "MODULES", tostring(modules) },
+		{ "VERSION", cleanVersion(lib._version) },
+	}
+	for i, card in ipairs(self.cards) do
+		card.label:SetText(data[i][1])
+		card.value:SetText(fit(data[i][2], 9))
+	end
+	local m = lib._matchedId and lib._games[lib._matchedId]
+	self.placeHint:SetText(m and fit("Current place matches: " .. m.Title, self.welcomeChars) or "")
+end
+
+function UI:RefreshGame(g)
+	self.gameInitial:SetText(g._initial)
+	self.gameTitle:SetText(fit(g.Title, self.gameTitleChars))
+	local parts = {}
+	if not g.Enabled then
+		parts[#parts + 1] = "UNAVAILABLE"
+	elseif g.Module then
+		parts[#parts + 1] = "MODULE " .. string.upper(g._moduleState)
+	else
+		parts[#parts + 1] = "READY"
+	end
+	if g.Version then
+		parts[#parts + 1] = "v" .. cleanVersion(g.Version)
+	end
+	if self.lib._matchedId == g.Id then
+		parts[#parts + 1] = "CURRENT PLACE"
+	end
+	self.gameInfo:SetText(fit(table.concat(parts, "  |  "), self.infoChars))
+	local desc = (g.Description and g.Description ~= "") and g.Description or "No description provided."
+	local lines = wrapText(desc, self.descChars, #self.descLines)
+	for i, node in ipairs(self.descLines) do
+		node:SetText(lines[i] or "")
+	end
+	self.featCountLbl:SetText(#g.Features .. (#g.Features == 1 and " ITEM" or " ITEMS"))
+end
+
+function UI:RefreshFeatures()
+	local lib = self.lib
+	local g = lib._games[lib._selectedId]
+	if not g then
+		return
+	end
+	local list = g.Features
+	local n = #self.featSlots
+	self.featOffset = clamp(self.featOffset, 0, math.max(0, #list - n))
+	for i, slot in ipairs(self.featSlots) do
+		local f = list[self.featOffset + i]
+		slot.feature = f
+		if f then
+			local canRun = g.Enabled and f.Enabled
+			slot.title:SetText(fit(f.Title, self.featTitleChars))
+			slot.desc:SetText(fit(f.Description or "", self.featDescChars))
+			slot.title:SetToken(canRun and "text" or "muted")
+			for _, node in ipairs(slot.nodes) do
+				node:Show(true)
+			end
+			slot.btn:Show(true)
+			if f._running then
+				slot.btn:SetText("...")
+			elseif f.Toggle then
+				slot.btn:SetText(f.State and "ON" or "OFF")
+			else
+				slot.btn:SetText("RUN")
+			end
+			slot.btn:SetActive(f.Toggle == true and f.State == true)
+			slot.btn:SetEnabled(canRun and not f._running)
+		else
+			for _, node in ipairs(slot.nodes) do
+				node:Show(false)
+			end
+			slot.btn:Show(false)
+		end
+	end
+	updateScrollbar(self.featTrack, self.featThumb, self.featListTop, self.featListH, self.featOffset, #list, n)
+	if #list == 0 then
+		self.featEmpty:SetText("No features registered for this game")
+		self.featEmpty:Show(true)
+	else
+		self.featEmpty:Show(false)
+	end
+	self:ReHover()
+end
+
+function UI:RefreshContent()
+	local lib = self.lib
+	local g = lib._games[lib._selectedId]
+	self.r:SetGroupHidden(self.groups.welcome, g ~= nil)
+	self.r:SetGroupHidden(self.groups.game, g == nil)
+	if g then
+		self:RefreshGame(g)
+		self:RefreshFeatures()
+		for _, slot in ipairs(self.slots) do
+			self:RefreshSlotVisual(slot)
+		end
+	else
+		self:RefreshWelcome()
+	end
+end
+
+function UI:RefreshLog()
+	local logs = self.lib._logs
+	local n = #self.logLines
+	for i = 1, n do
+		local e = logs[#logs - n + i]
+		local node = self.logLines[i]
+		if e then
+			local text = LEVEL_MARK[e.level] .. " " .. e.msg .. (e.count > 1 and (" (x" .. e.count .. ")") or "")
+			node:SetText(fit(text, self.logChars))
+			node:SetToken((e.level == "info") and "textDim" or "text")
+		else
+			node:SetText("")
+		end
+	end
+end
+
+function UI:RefreshAll()
+	self:RefreshHeader()
+	self:RefreshSearch()
+	self:RefreshList()
+	self:RefreshContent()
+	self:RefreshLog()
+end
+
+function UI:ApplyTheme()
+	self.r:ApplyTheme(self.lib._theme)
+end
+
+function UI:Destroy()
+	if self.dead then
+		return
+	end
+	self:SetFocus(false)
+	self.dead = true
+	self.tipToken = self.tipToken + 1
+	self.filterToken = self.filterToken + 1
+	self.janitor:Cleanup()
+	self.r:Destroy()
+	self.regions = {}
+end
+
+----------------------------------------------------------------------
+-- 6. LIBRARY: REGISTRY, LIFECYCLE, PUBLIC API
+----------------------------------------------------------------------
+
+local Library = {}
+Library.__index = Library
+
+local UniversalLibrary = {}
+UniversalLibrary.Version = LIB_VERSION
+
+function UniversalLibrary.GetCapabilities()
+	return shallowCopy(getCapabilities())
+end
+
+-- internal helpers ---------------------------------------------------------
+function Library:_log(level, msg)
+	msg = tostring(msg):gsub("%s+", " ")
+	local logs = self._logs
+	local last = logs[#logs]
+	if last and last.msg == msg and last.level == level then
+		last.count = last.count + 1
+	else
+		table.insert(logs, { level = level, msg = msg, count = 1 })
+		if #logs > L.MAX_LOGS then
+			table.remove(logs, 1)
+		end
+		if level == "error" or level == "warn" then
+			warn(LOG_TAG, msg)
+		elseif self._debug then
+			print(LOG_TAG, msg)
+		end
+	end
+	self:_refresh("Log")
+end
+
+-- Invalid arguments: raise when Strict (default), otherwise log + return nil, msg.
+function Library:_fail(method, msg)
+	local full = method .. ": " .. msg
+	self:_log("error", full)
+	if self._strict then
+		error(LOG_TAG .. " " .. full, 0)
+	end
+	return nil, full
+end
+
+function Library:_refresh(...)
+	local ui = self._ui
+	if not ui or ui.dead then
+		return
+	end
+	for _, what in ipairs({ ... }) do
+		ui["Refresh" .. what](ui)
+	end
+end
+
+function Library:_setStatus(kind, text, ttl)
+	self._status = { kind = kind, text = text }
+	self._statusToken = self._statusToken + 1
+	local token = self._statusToken
+	if ttl then
+		task.delay(ttl, function()
+			if self._statusToken == token then
+				self._status = { kind = "ready", text = "READY" }
+				self:_refresh("Status")
+			end
+		end)
+	end
+	self:_refresh("Status")
+end
+
+function Library:_rebuildFilter()
+	local q = self._query:lower()
+	local out = {}
+	for _, id in ipairs(self._order) do
+		local g = self._games[id]
+		if q == "" or g._search:find(q, 1, true) then
+			out[#out + 1] = id
+		end
+	end
+	self._filtered = out
+end
+
+function Library:_computeMatch()
+	self._matchedId = nil
+	local pid = game.PlaceId
+	if not self._autoDetect or pid == 0 then
+		return
+	end
+	for _, id in ipairs(self._order) do
+		local g = self._games[id]
+		if g.PlaceIds and table.find(g.PlaceIds, pid) then
+			self._matchedId = id
+			break
+		end
+	end
+end
+
+-- validation ---------------------------------------------------------------
+local function normaliseFeature(def)
+	if type(def) ~= "table" then
+		return nil, "a feature must be a table"
+	end
+	if not isString(def.Title) and not isString(def.Id) then
+		return nil, "a feature needs a Title or an Id"
+	end
+	if def.Callback ~= nil and type(def.Callback) ~= "function" then
+		return nil, "feature Callback must be a function"
+	end
+	if def.Description ~= nil and type(def.Description) ~= "string" then
+		return nil, "feature Description must be a string"
+	end
+	local f = shallowCopy(def)
+	f.Title = isString(def.Title) and trim(def.Title) or trim(def.Id)
+	f.Id = isString(def.Id) and trim(def.Id) or slugify(f.Title)
+	if f.Id == "" then
+		return nil, "could not derive a feature id"
+	end
+	f.Enabled = def.Enabled ~= false
+	f.Toggle = def.Toggle == true
+	f.State = f.Toggle and (def.Default == true or def.State == true) or false
+	f._running = false
+	return f
+end
+
+local function normalisePlaceIds(v)
+	if v == nil then
+		return nil
+	end
+	if type(v) == "number" then
+		return { v }
+	end
+	if type(v) ~= "table" then
+		return nil, "PlaceIds must be a number or a list of numbers"
+	end
+	local out = {}
+	for _, id in ipairs(v) do
+		if type(id) ~= "number" then
+			return nil, "PlaceIds must contain only numbers"
+		end
+		out[#out + 1] = id
+	end
+	return out
+end
+
+-- public API -----------------------------------------------------------------
+function UniversalLibrary.new(config)
+	if config ~= nil and type(config) ~= "table" then
+		error(LOG_TAG .. " new: config must be a table", 2)
+	end
+	config = config or {}
+	local self = setmetatable({}, Library)
+	self._title = isString(config.Title) and config.Title or "UNIVERSAL"
+	self._subtitle = isString(config.Subtitle) and config.Subtitle or "GAME SCRIPT LIBRARY"
+	self._version = config.Version ~= nil and tostring(config.Version) or LIB_VERSION
+	self._strict = config.Strict ~= false
+	self._debug = config.Debug == true
+	self._autoDetect = config.AutoDetect ~= false
+	self._autoSelect = config.AutoSelect == true
+	self._singleInstance = config.SingleInstance ~= false
+	self._toggleKey = typeof(config.ToggleKey) == "EnumItem" and config.ToggleKey or Enum.KeyCode.RightShift
+	self._position = typeof(config.Position) == "Vector2" and config.Position or nil
+	self._games, self._order, self._filtered = {}, {}, {}
+	self._selectedId, self._matchedId = nil, nil
+	self._query = ""
+	self._logs = {}
+	self._toastQueue = {}
+	self._status = { kind = "ready", text = "READY" }
+	self._statusToken = 0
+	self._themeName, self._themeOverrides = "Monochrome", {}
+	self._theme = resolveTheme("Monochrome", {})
+	self._ui = nil
+	if config.Theme ~= nil then
+		self:SetTheme(config.Theme)
+	end
+	return self
+end
+
+function Library:SetTitle(title)
+	if not isString(title) then
+		return self:_fail("SetTitle", "title must be a non-empty string")
+	end
+	self._title = title
+	self:_refresh("Header", "Content")
+	return self
+end
+
+function Library:SetSubtitle(subtitle)
+	if type(subtitle) ~= "string" then
+		return self:_fail("SetSubtitle", "subtitle must be a string")
+	end
+	self._subtitle = subtitle
+	self:_refresh("Header")
+	return self
+end
+
+function Library:SetTheme(config)
+	local name = self._themeName
+	local overrides = shallowCopy(self._themeOverrides)
+	if type(config) == "string" then
+		name, overrides = config, {}
+	elseif type(config) == "table" then
+		if config.Name ~= nil then
+			name = config.Name
+		end
+		local colors = type(config.Colors) == "table" and config.Colors or config
+		for k, v in pairs(colors) do
+			if type(k) == "string" and k ~= "Name" and k ~= "Colors" then
+				local token = THEME_LOOKUP[k:lower()]
+				if not token then
+					return self:_fail("SetTheme", "unknown theme key '" .. k .. "'")
+				end
+				local c = parseColor(v)
+				if not c then
+					return self:_fail("SetTheme", "invalid colour for '" .. k .. "' (use Color3 or \"#RRGGBB\")")
+				end
+				overrides[token] = c
+			end
+		end
+	else
+		return self:_fail("SetTheme", "expected a theme name or a table")
+	end
+	if not Themes[name] then
+		return self:_fail("SetTheme", "unknown theme '" .. tostring(name) .. "'")
+	end
+	self._themeName, self._themeOverrides = name, overrides
+	self._theme = resolveTheme(name, overrides)
+	if self._ui and not self._ui.dead then
+		self._ui:ApplyTheme()
+	end
+	return self
+end
+
+function Library:GetGame(id)
+	return type(id) == "string" and self._games[id] or nil
+end
+
+function Library:AddGame(config)
+	if type(config) ~= "table" then
+		return self:_fail("AddGame", "config must be a table")
+	end
+	local title = isString(config.Title) and trim(config.Title) or (isString(config.Id) and trim(config.Id) or nil)
+	if not title then
+		return self:_fail("AddGame", "a Title (or Id) is required")
+	end
+	local id
+	if config.Id ~= nil then
+		if not isString(config.Id) then
+			return self:_fail("AddGame", "Id must be a non-empty string")
+		end
+		id = trim(config.Id)
+	else
+		id = slugify(title)
+		if id == "" then
+			return self:_fail("AddGame", "could not generate an Id from the Title; supply one")
+		end
+	end
+	if self._games[id] then
+		return self:_fail("AddGame", "duplicate game id '" .. id .. "'")
+	end
+	if config.Description ~= nil and type(config.Description) ~= "string" then
+		return self:_fail("AddGame", "Description must be a string")
+	end
+	if config.Callback ~= nil and type(config.Callback) ~= "function" then
+		return self:_fail("AddGame", "Callback must be a function")
+	end
+	if config.Icon ~= nil and type(config.Icon) ~= "string" then
+		return self:_fail("AddGame", "Icon must be a string")
+	end
+	local placeIds, perr = normalisePlaceIds(config.PlaceIds or config.PlaceId)
+	if perr then
+		return self:_fail("AddGame", perr)
+	end
+	local mod = config.Module
+	if mod ~= nil then
+		if type(mod) ~= "table" then
+			return self:_fail("AddGame", "Module must be a table")
+		end
+		if mod.Initialize ~= nil and type(mod.Initialize) ~= "function" then
+			return self:_fail("AddGame", "Module.Initialize must be a function")
+		end
+		if mod.Cleanup ~= nil and type(mod.Cleanup) ~= "function" then
+			return self:_fail("AddGame", "Module.Cleanup must be a function")
+		end
+	end
+	if config.Features ~= nil and type(config.Features) ~= "table" then
+		return self:_fail("AddGame", "Features must be a list")
+	end
+
+	local g = shallowCopy(config)
+	g.Id, g.Title = id, title
+	g.Description = config.Description or ""
+	g.Enabled = config.Enabled ~= false
+	g.PlaceIds = placeIds
+	g.Version = config.Version ~= nil and tostring(config.Version) or (mod and mod.Version ~= nil and tostring(mod.Version)) or nil
+	g.Settings = config.Settings or (mod and mod.Settings) or {}
+	g.Features, g._featureIndex = {}, {}
+	g._initial = (config.Icon and #config.Icon > 0 and #config.Icon <= 3) and config.Icon
+		or (title:match("%w") or "?"):upper()
+	g._search = (title .. " " .. id .. " " .. g.Description):lower()
+	g._moduleState = mod and "idle" or "none"
+
+	local defs = {}
+	for _, d in ipairs(config.Features or {}) do
+		defs[#defs + 1] = d
+	end
+	if mod and type(mod.Features) == "table" then
+		for _, d in ipairs(mod.Features) do
+			defs[#defs + 1] = d
+		end
+	end
+	for _, d in ipairs(defs) do
+		local f, err = normaliseFeature(d)
+		if not f then
+			return self:_fail("AddGame", "game '" .. id .. "': " .. err)
+		end
+		if g._featureIndex[f.Id] then
+			return self:_fail("AddGame", "game '" .. id .. "': duplicate feature id '" .. f.Id .. "'")
+		end
+		g._featureIndex[f.Id] = f
+		g.Features[#g.Features + 1] = f
+	end
+
+	self._games[id] = g
+	self._order[#self._order + 1] = id
+	self:_rebuildFilter()
+	self:_computeMatch()
+	self:_log("info", "Registered " .. title)
+	self:_refresh("List", "Content")
+	return g
+end
+
+function Library:RemoveGame(id)
+	local g = type(id) == "string" and self._games[id] or nil
+	if not g then
+		self:_log("warn", "RemoveGame: unknown game '" .. tostring(id) .. "'")
+		return false
+	end
+	if self._selectedId == id then
+		self:SelectGame(nil)
+	end
+	self:_stopModule(g)
+	self._games[id] = nil
+	local idx = table.find(self._order, id)
+	if idx then
+		table.remove(self._order, idx)
+	end
+	self:_rebuildFilter()
+	self:_computeMatch()
+	self:_log("info", "Removed " .. g.Title)
+	self:_refresh("List", "Content")
+	return true
+end
+
+function Library:AddFeature(gameId, feature)
+	local g = type(gameId) == "string" and self._games[gameId] or nil
+	if not g then
+		return self:_fail("AddFeature", "unknown game '" .. tostring(gameId) .. "'")
+	end
+	local f, err = normaliseFeature(feature)
+	if not f then
+		return self:_fail("AddFeature", err)
+	end
+	if g._featureIndex[f.Id] then
+		return self:_fail("AddFeature", "duplicate feature id '" .. f.Id .. "' for game '" .. gameId .. "'")
+	end
+	g._featureIndex[f.Id] = f
+	g.Features[#g.Features + 1] = f
+	if self._selectedId == gameId then
+		self:_refresh("Content")
+	end
+	return f
+end
+
+function Library:Notify(config)
+	if type(config) == "string" then
+		config = { Message = config }
+	end
+	if type(config) ~= "table" then
+		return self:_fail("Notify", "expected a string or a table")
+	end
+	local item = {
+		title = isString(config.Title) and config.Title or self._title,
+		message = tostring(config.Message or config.Text or config.Content or ""),
+		duration = clamp(tonumber(config.Duration) or 3, 1, 15),
+	}
+	self:_log("info", item.title .. ": " .. item.message)
+	local ui = self._ui
+	if ui and not ui.dead then
+		if #self._toastQueue < 20 then
+			table.insert(self._toastQueue, item)
+		end
+		ui:PumpToasts()
+	end
+	return true
+end
+
+function Library:SetVisible(b)
+	if self._ui and not self._ui.dead then
+		self._ui:SetVisible(b == true)
+	end
+end
+
+-- module lifecycle -------------------------------------------------------------
+function Library:_makeContext(g, janitor)
+	return {
+		Library = self,
+		Game = g,
+		Janitor = janitor,
+		Settings = g.Settings,
+		PlaceId = game.PlaceId,
+		Log = function(msg, level)
+			self:_log(level or "info", msg)
+		end,
+		Notify = function(cfg)
+			self:Notify(cfg)
+		end,
+		IsActive = function()
+			return g._janitor == janitor
+		end,
+	}
+end
+
+function Library:_startModule(g)
+	local mod = g.Module
+	if type(mod) ~= "table" then
+		g._moduleState = "none"
+		return
+	end
+	if g._moduleState == "initializing" or g._moduleState == "active" then
+		return
+	end
+	local token = {}
+	local janitor = Janitor.new()
+	g._token, g._janitor = token, janitor
+	g._moduleState = "initializing"
+	self:_setStatus("busy", "BUSY") -- set before spawning: Initialize may finish synchronously
+	task.spawn(function()
+		local ok, err = true, nil
+		if type(mod.Initialize) == "function" then
+			ok, err = pcall(mod.Initialize, self:_makeContext(g, janitor))
+		end
+		if g._token ~= token then
+			-- selection moved on while Initialize was running
+			if ok and type(mod.Cleanup) == "function" then
+				pcall(mod.Cleanup)
+			end
+			janitor:Cleanup()
+			return
+		end
+		if ok then
+			g._moduleState = "active"
+			self:_log("ok", g.Title .. " module ready")
+			self:_setStatus("ready", "READY")
+		else
+			g._moduleState = "failed"
+			janitor:Cleanup()
+			g._janitor = nil
+			self:_log("error", g.Title .. " module failed: " .. tostring(err))
+			self:_setStatus("error", "ERROR", 4)
+		end
+		if self._selectedId == g.Id then
+			self:_refresh("Content")
+		end
+	end)
+end
+
+function Library:_stopModule(g)
+	local state = g._moduleState
+	g._token = nil -- invalidates a pending Initialize
+	if state == "active" and type(g.Module) == "table" and type(g.Module.Cleanup) == "function" then
+		local ok, err = pcall(g.Module.Cleanup)
+		if not ok then
+			self:_log("error", g.Title .. " cleanup failed: " .. tostring(err))
+		end
+	end
+	if g._janitor then
+		g._janitor:Cleanup()
+		g._janitor = nil
+	end
+	g._moduleState = g.Module and "idle" or "none"
+	-- features that were mid-run keep their own pcall; reset toggles that depended on the module
+end
+
+function Library:SelectGame(id)
+	if id ~= nil and type(id) ~= "string" then
+		return self:_fail("SelectGame", "id must be a string or nil")
+	end
+	local g
+	if id ~= nil then
+		g = self._games[id]
+		if not g then
+			self:_log("warn", "SelectGame: unknown game '" .. id .. "'")
+			return false, "unknown game"
+		end
+	end
+	if self._selectedId == id then
+		return true
+	end
+	local prev = self._games[self._selectedId]
+	if prev then
+		self:_stopModule(prev)
+	end
+	self._selectedId = id
+	if self._ui and not self._ui.dead then
+		self._ui.featOffset = 0
+	end
+	if g and g.Enabled then
+		self:_startModule(g)
+	end
+	self:_refresh("List", "Content")
+	if g then
+		if g.Enabled then
+			self:_log("info", "Selected " .. g.Title)
+			if type(g.Callback) == "function" then
+				task.spawn(function()
+					local ok, err = pcall(g.Callback, g)
+					if not ok then
+						self:_log("error", g.Title .. " callback failed: " .. tostring(err))
+						self:_setStatus("error", "ERROR", 4)
+					end
+				end)
+			end
+		else
+			self:_log("warn", g.Title .. " is currently unavailable")
+		end
+	end
+	return true
+end
+
+function Library:_activateFeature(g, f)
+	if not g.Enabled then
+		self:_log("warn", g.Title .. " is unavailable")
+		return
+	end
+	if not f.Enabled then
+		self:_log("warn", f.Title .. " is disabled")
+		return
+	end
+	if f._running then
+		self:_log("warn", f.Title .. " is already running")
+		return
+	end
+	if g.Module and f.RequiresModule ~= false and g._moduleState ~= "active" then
+		local why = g._moduleState == "failed" and "its module failed to initialise"
+			or "its module is not active yet"
+		self:_log("warn", f.Title .. " blocked: " .. why)
+		return
+	end
+	if type(f.Callback) ~= "function" then
+		self:_log("warn", f.Title .. " has no action attached")
+		return
+	end
+	f._running = true
+	self:_setStatus("busy", "BUSY")
+	self:_refresh("Features")
+	task.spawn(function()
+		local prev = f.State
+		if f.Toggle then
+			f.State = not f.State
+		end
+		local ok, err = pcall(f.Callback, f, g)
+		f._running = false
+		if ok then
+			if f.Toggle then
+				self:_log("ok", f.Title .. ": " .. (f.State and "ON" or "OFF"))
+			else
+				self:_log("ok", f.Title .. " executed")
+			end
+			self:_setStatus("ready", "READY")
+		else
+			if f.Toggle then
+				f.State = prev
+			end
+			self:_log("error", f.Title .. " failed: " .. tostring(err))
+			self:_setStatus("error", "ERROR", 4)
+		end
+		if self._selectedId == g.Id then
+			self:_refresh("Features")
+		end
+	end)
+end
+
+-- init / destroy ------------------------------------------------------------------
+function Library:Init()
+	if self._ui and not self._ui.dead then
+		self._ui:Show()
+		return true
+	end
+	local caps = getCapabilities()
+	if not (caps.Drawing and caps.Square and caps.Text) then
+		local missing = {}
+		if not caps.Drawing then
+			missing[#missing + 1] = "Drawing library"
+		end
+		if not caps.Square then
+			missing[#missing + 1] = "Drawing.new(\"Square\")"
+		end
+		if not caps.Text then
+			missing[#missing + 1] = "Drawing.new(\"Text\")"
+		end
+		local msg = "Unsupported environment, missing: " .. table.concat(missing, ", ")
+			.. ". The Drawing API is executor-specific and is not available in standard Roblox scripts."
+		self:_log("error", msg)
+		return false, msg
+	end
+
+	local env = getEnvTable()
+	if env and self._singleInstance then
+		local prev = env.__UniversalLibraryInstance
+		if prev and prev ~= self and type(prev.Destroy) == "function" then
+			pcall(prev.Destroy, prev)
+		end
+		env.__UniversalLibraryInstance = self
+	end
+
+	local ui = UI.new(self, caps)
+	local ok, err = pcall(function()
+		ui:Build()
+		ui:Bind()
+	end)
+	if not ok then
+		ui:Destroy() -- never leave a partial window behind
+		self:_log("error", "Init failed: " .. tostring(err))
+		return false, tostring(err)
+	end
+	self._ui = ui
+	self:_rebuildFilter()
+	self:_computeMatch()
+	ui:RefreshAll()
+	self:_log("ok", "Initialised v" .. cleanVersion(self._version))
+	if self._autoSelect and self._matchedId then
+		self:SelectGame(self._matchedId)
+	end
+	return true
+end
+
+function Library:Destroy(clearRegistry)
+	if self._destroying then
+		return
+	end
+	self._destroying = true
+	for _, g in pairs(self._games) do
+		self:_stopModule(g)
+	end
+	self._selectedId = nil
+	self._toastQueue = {}
+	self._statusToken = self._statusToken + 1
+	self._status = { kind = "ready", text = "READY" }
+	local ui = self._ui
+	self._ui = nil
+	if ui then
+		ui:Destroy()
+	end
+	local env = getEnvTable()
+	if env and env.__UniversalLibraryInstance == self then
+		env.__UniversalLibraryInstance = nil
+	end
+	if clearRegistry == true then
+		self._games, self._order, self._filtered = {}, {}, {}
+		self._matchedId = nil
+	end
+	self._destroying = false
+end
+
+----------------------------------------------------------------------
+-- 7. EXAMPLE (placeholder callbacks only; replace with your own logic)
+----------------------------------------------------------------------
+
+if RUN_EXAMPLE then
+	local Library = UniversalLibrary.new({
+		Title = "UNIVERSAL",
+		Subtitle = "GAME SCRIPT LIBRARY",
+		Version = "1.0.0",
+		Theme = "Monochrome",
+	})
+
+	Library:AddGame({
+		Id = "the-bronx",
+		Title = "The Bronx",
+		Description = "Game-specific utilities. Replace the placeholder PlaceIds with real place IDs to enable current-place highlighting.",
+		PlaceIds = { 1234567890 },
+		Callback = function(entry)
+			print("Selected game:", entry.Title)
+		end,
+		Features = {
+			{
+				Id = "example-feature",
+				Title = "Example Feature",
+				Description = "Demonstration feature",
+				Callback = function()
+					print("Feature activated")
+				end,
+			},
+			{
+				Id = "example-toggle",
+				Title = "Example Toggle",
+				Description = "Demonstration toggle (state is in feature.State)",
+				Toggle = true,
+				Callback = function(feature)
+					print("Toggle is now", feature.State)
+				end,
+			},
+		},
+	})
+
+	Library:AddGame({
+		Id = "example-game",
+		Title = "Example Game",
+		Description = "A second registered game with no features and no module.",
+		Callback = function(entry)
+			print("Selected game:", entry.Title)
+		end,
+	})
+
+	Library:AddGame({
+		Id = "modular-demo",
+		Title = "Modular Demo",
+		Description = "Shows the module contract: Initialize on select, Cleanup on switch or close, and a Janitor for connections.",
+		Version = "0.1.0",
+		Module = {
+			Initialize = function(context)
+				context.Log("Modular Demo initialised")
+				-- anything added to the janitor is released automatically on cleanup
+				context.Janitor:Add(function()
+					print("Janitor released Modular Demo resources")
+				end)
+			end,
+			Cleanup = function()
+				print("Modular Demo cleaned up")
+			end,
+			Features = {
+				{
+					Id = "ping",
+					Title = "Ping",
+					Description = "Shows a notification",
+					Callback = function()
+						Library:Notify({ Title = "Modular Demo", Message = "Pong!", Duration = 3 })
+					end,
+				},
+			},
+		},
+	})
+
+	Library:AddGame({
+		Id = "coming-soon",
+		Title = "Coming Soon",
+		Description = "Disabled entries stay visible but cannot run.",
+		Enabled = false,
+	})
+
+	local ok, err = Library:Init()
+	if not ok then
+		warn("[Universal] Init failed:", err)
+	end
+end
+
+return UniversalLibrary
