@@ -6,9 +6,8 @@
  Single-file, Drawing-API based, black-and-white game launcher UI for Roblox.
 ================================================================================
 
- This file is a UI + registry framework. It contains NO game logic of its own:
- every callback in the example section at the bottom is a placeholder that you
- replace with your own code.
+ This file is a script loader UI. It contains NO game logic of its own: you attach
+ a script to each game and the RUN button launches it.
 
  ENVIRONMENT REQUIREMENTS / ASSUMPTIONS
    * Client-side (LocalScript context or a script executor).
@@ -32,6 +31,7 @@
    UniversalLibrary.new(config)  -> Library
        config: Title, Subtitle, Version, Theme ("Monochrome" | "Inverted" | table),
                Position (Vector2), ToggleKey (Enum.KeyCode, default RightShift),
+               Welcome = { Title, Subtitle, Button = { Text, Callback } }
                AutoDetect (bool, default true)  highlight game matching game.PlaceId
                AutoSelect (bool, default false) also select the matching game on Init
                SingleInstance (bool, default true) destroy a previous instance
@@ -39,12 +39,9 @@
                       false they are logged and the method returns nil, message
                Debug (bool) mirror every log line to the output window
    Library:SetTitle(title)            Library:SetSubtitle(subtitle)
-   Library:AddGame(config) -> game    Library:RemoveGame(id) -> bool
-   Library:GetGame(id) -> game|nil    Library:SelectGame(id|nil) -> bool
-   Library:AddFeature(gameId, feature) -> feature
+   Library:SetWelcome(config)         Library:AddGame(config)
    Library:Notify(config | string)    Library:SetTheme(name | table)
-   Library:Init() -> bool, err        Library:Destroy([clearRegistry])
-   Extras: Library:SetVisible(bool), Library:RunGame(id), UniversalLibrary.GetCapabilities()
+   Library:Init() -> bool, err        Library:Destroy()
 
  THIS IS A SCRIPT LOADER
    The library only lists games and launches the script you attach to each one.
@@ -54,18 +51,14 @@
    error is printed with warn() because the UI is already gone.
 
  AddGame(config) FIELDS
-   Id           string   unique. If omitted it is generated from Title:
-                         lower-case, runs of non-alphanumerics become "-",
-                         e.g. "The Bronx!" -> "the-bronx". A duplicate id (given
-                         or generated) is rejected, never silently replaced.
-   Title        string   display name (falls back to Id).
+   Title        string   display name (required).
    Description  string   short summary.
    PlaceIds     number | {number}   place ids of the game. Used for current-game
                          detection; the FIRST id also supplies the thumbnail.
    IconPlaceId  number   optional, overrides which place the thumbnail comes from.
    Version      string   optional, shown in the game header.
    Icon         string   optional, up to 3 characters shown if no thumbnail loads.
-   Features     { "Name", ... } or { {Title, Description}, ... }  display-only list.
+   Features     { "Name", ... }   display-only text list (not interactive).
    Run          function(game)   what the RUN button executes. Put your loadstring
                          here, e.g.
                            Run = function()
@@ -78,14 +71,29 @@
                          (selecting never runs the script).
    Any other keys are kept on the game table (forward compatible).
    RUN is disabled for an entry that has neither Run nor Script.
+   Games have no Id to manage: the library keys them internally by title.
+
+ HOME / WELCOME PAGE
+   The page shown before a game is selected. A HOME button appears in the header
+   while a game is open and takes you back to it.
+     Welcome = {
+         Title    = "Welcome to Universal",     -- default: "Welcome to <Title>"
+         Subtitle = "Pick a game ...",          -- default: select-a-game text
+         Button   = { Text = "DISCORD", Callback = function(Library) ... end },
+     }
+   Pass it to UniversalLibrary.new({ Welcome = ... }) or call
+   Library:SetWelcome({ ... }) at any time (only the fields you pass change;
+   Button = false removes the button). The callback runs in its own pcall'd
+   thread, receives the Library, and does NOT close the UI; call
+   Library:Destroy() inside it if you want that.
 
  CURRENT GAME DETECTION
-   On Init (and whenever games are added or removed) game.PlaceId is compared with
-   every entry's PlaceIds. A match gets a green "CURRENT GAME" indicator in the
-   list and in its header, and is always sorted to the top of the list (even while
-   searching). Detection can be switched off with AutoDetect = false, and
-   AutoSelect = true selects the matching entry automatically. Browsing and
-   selecting any other entry always works.
+   On Init (and whenever games are added) game.PlaceId is compared with every
+   entry's PlaceIds. A match shows a green "CURRENT GAME" label (in the list and in
+   its header) and is always sorted to the top of the list (even while searching).
+   Detection can be switched off with AutoDetect = false, and AutoSelect = true
+   selects the matching entry automatically. Browsing and selecting any other
+   entry always works.
 
  LOADING / DISTRIBUTION (the registrations below never change between methods)
    A. Local standalone: loadstring(readfile("UniversalLibrary.lua"))() returns
@@ -106,7 +114,7 @@
 
  ADDING ANOTHER GAME
    Library:AddGame({
-       Id = "my-game", Title = "My Game", Description = "What it does",
+       Title = "My Game", Description = "What it does",
        PlaceIds = { 1234567890 },          -- current-game detection + thumbnail
        Features = { "Feature one", "Feature two" },
        Run = function()
@@ -846,7 +854,6 @@ function UI.new(lib, caps)
 	self.regions, self.slots, self.featSlots, self.toastSlots = {}, {}, {}, {}
 	self.descLines, self.cards = {}, {}
 	self.thumbWait = {}
-	self.selectedFeature = nil
 	self.welcomeLines = {}
 	self.listOffset, self.featOffset = 0, 0
 	self.tipToken, self.filterToken = 0, 0
@@ -918,7 +925,7 @@ end
 function UI:Button(o)
 	local r = self.r
 	local size = o.size or 11
-	local b = { enabled = true, hover = false, active = false }
+	local b = { enabled = true, hover = false, active = false, primary = o.primary == true }
 	b.bg = r:Rect({ x = o.x, y = o.y, w = o.w, h = o.h, token = "panel2", group = o.group, z = o.z })
 	b.border = r:Rect({ x = o.x, y = o.y, w = o.w, h = o.h, filled = false, token = "border", group = o.group, z = o.z + 1 })
 	b.label = r:Label({
@@ -943,7 +950,19 @@ function UI:Button(o)
 	})
 	function b:Refresh()
 		local hot = self.hover and self.enabled
-		if self.active then
+		if self.primary then
+			-- solid call-to-action: filled light button with dark text, dims on hover
+			if self.enabled then
+				local tok = hot and "textDim" or "text"
+				self.bg:SetToken(tok)
+				self.border:SetToken(tok)
+				self.label:SetToken("bg")
+			else
+				self.bg:SetToken("panel2")
+				self.border:SetToken("border")
+				self.label:SetToken("muted")
+			end
+		elseif self.active then
 			self.bg:SetToken("text")
 			self.border:SetToken("text")
 			self.label:SetToken("bg")
@@ -1002,6 +1021,11 @@ function UI:Build()
 		x = W - 34, y = 11, w = 24, h = 24, text = "x", group = gHeader, z = 6,
 		onClick = function() lib:Destroy() end, tooltip = "Close",
 	})
+	self.btnHome = self:Button({
+		x = W - 34 - 8 - 56, y = 11, w = 56, h = 24, text = "HOME", group = gHeader, z = 6,
+		onClick = function() lib:_selectGame(nil) end, tooltip = "Back to the welcome page",
+	})
+	self.btnHome:Show(false)
 	self:AddRegion({ id = "drag", x = 0, y = 0, w = W, h = HEADER, group = gHeader, z = 1, drag = true })
 
 	-- sidebar ------------------------------------------------------------
@@ -1022,7 +1046,7 @@ function UI:Build()
 	local slotCount = math.max(1, math.floor((H - 10 - listY) / L.ROW_H))
 	self.listY, self.listH = listY, slotCount * L.ROW_H
 	local rowW = SB - 22
-	local textPx = (SB - 28) - 54 - 6
+	local textPx = SB - 80
 	self.rowTitleChars, self.rowDescChars = r:Capacity(textPx, 13), r:Capacity(textPx, 10)
 	for i = 1, slotCount do
 		local y = listY + (i - 1) * L.ROW_H
@@ -1034,13 +1058,12 @@ function UI:Build()
 		slot.initial = r:Label({ x = 30, y = y + 11, size = 13, align = "center", token = "textDim", group = gBody, z = 6 })
 		slot.title = r:Label({ x = 54, y = y + 6, size = 13, token = "text", group = gBody, z = 6 })
 		slot.desc = r:Label({ x = 54, y = y + 22, size = 10, token = "muted", group = gBody, z = 6 })
-		slot.dot = r:Rect({ x = SB - 28, y = y + 16, w = 5, h = 5, token = "textDim", group = gBody, z = 6 })
-		slot.nodes = { slot.bg, slot.bar, slot.img, slot.box, slot.initial, slot.title, slot.desc, slot.dot }
+		slot.nodes = { slot.bg, slot.bar, slot.img, slot.box, slot.initial, slot.title, slot.desc }
 		slot.region = self:AddRegion({
 			x = 6, y = y, w = rowW, h = L.ROW_H - 2, group = gBody, z = 4, on = false,
 			onClick = function()
 				if slot.id then
-					lib:SelectGame(slot.id)
+					lib:_selectGame(slot.id)
 				end
 			end,
 			onEnter = function()
@@ -1072,9 +1095,11 @@ function UI:Build()
 		end,
 	})
 
-	-- welcome view -------------------------------------------------------
+	-- welcome view ------------------------------------------------------
 	local top = HEADER + 16
+	self.gameTop = top
 	self.welcomeTitle = r:Label({ x = cx, y = top + 8, size = 20, token = "text", group = gWelcome, z = 6 })
+	self.welcomeTitleChars = r:Capacity(cw, 20)
 	self.welcomeChars = r:Capacity(cw, 12)
 	for i = 1, 2 do
 		self.welcomeLines[i] = r:Label({ x = cx, y = top + 44 + (i - 1) * 16, size = 12, token = "textDim", group = gWelcome, z = 6 })
@@ -1091,24 +1116,31 @@ function UI:Build()
 		self.cards[i] = card
 	end
 	self.placeHint = r:Label({ x = cx, y = top + 170, size = 11, token = "textDim", group = gWelcome, z = 6 })
+	local wbW = 180
+	self.welcomeBtnChars = r:Capacity(wbW - 20, 12)
+	self.welcomeBtn = self:Button({
+		x = cx, y = top + 196, w = wbW, h = 30, text = "", size = 12, primary = true, group = gWelcome, z = 7,
+		onClick = function() lib:_welcomeAction() end,
+	})
 
 	-- game view ----------------------------------------------------------
-	local ICON, runW = 52, 88
+	local ICON, runW, runH = 52, 84, 30
 	self.gameImg = r:Image({ x = cx + 1, y = top + 1, w = ICON - 2, h = ICON - 2, group = gGame, z = 4 })
 	self.gameBox = r:Rect({ x = cx, y = top, w = ICON, h = ICON, filled = false, token = "text", group = gGame, z = 5 })
 	self.gameInitial = r:Label({ x = cx + ICON / 2, y = top + ICON / 2 - 12, size = 20, align = "center", token = "text", group = gGame, z = 6 })
 	local textX = cx + ICON + 14
 	local titlePx = cw - ICON - 14 - runW - 12
+	self.gameTextX = textX
 	self.gameTitleChars = r:Capacity(titlePx, 18)
-	self.gameTitle = r:Label({ x = textX, y = top + 6, size = 18, token = "text", group = gGame, z = 6 })
+	self.gameTitle = r:Label({ x = textX, y = top + 8, size = 18, token = "text", group = gGame, z = 6 })
 	self.infoChars = r:Capacity(titlePx, 10)
-	self.gameInfo = r:Label({ x = textX, y = top + 32, size = 10, token = "textDim", group = gGame, z = 6 })
-	self.gameTextX, self.gameInfoY = textX, top + 32
+	self.gameInfo = r:Label({ x = textX, y = top + 31, size = 10, token = "textDim", group = gGame, z = 6 })
 	self.liveW = r:TextWidth("CURRENT GAME", 10)
-	self.gameLiveDot = r:Rect({ x = textX, y = top + 34, w = 6, h = 6, token = "live", group = gGame, z = 6 })
-	self.gameLiveLbl = r:Label({ x = textX + 14, y = top + 32, size = 10, text = "CURRENT GAME", token = "live", group = gGame, z = 6 })
+	self.gameLiveDot = r:Rect({ x = textX, y = top + 33, w = 6, h = 6, token = "live", group = gGame, z = 6 })
+	self.gameLiveLbl = r:Label({ x = textX + 14, y = top + 31, size = 10, text = "CURRENT GAME", token = "live", group = gGame, z = 6 })
 	self.runBtn = self:Button({
-		x = cx + cw - runW, y = top + 12, w = runW, h = 28, text = "RUN", size = 12, group = gGame, z = 7,
+		x = cx + cw - runW, y = top + math.floor((ICON - runH) / 2), w = runW, h = runH, text = "RUN", size = 12,
+		primary = true, group = gGame, z = 7,
 		onClick = function()
 			local g = lib._games[lib._selectedId]
 			if g then
@@ -1131,47 +1163,19 @@ function UI:Build()
 	self.featCountLbl = r:Label({ x = cx + cw, y = top + 124, size = 10, align = "right", token = "textDim", group = gGame, z = 6 })
 	r:Rect({ x = cx, y = top + 140, w = cw, h = 1, token = "border", group = gGame, z = 3 })
 
-	-- plain feature list (text rows; hover for description, click to pin it)
-	local listTop = top + 148
-	local rows = math.max(1, math.floor((H - 56 - listTop) / L.LIST_ROW))
+	-- feature list: plain text only (no hover, no click); the mouse wheel scrolls it
+	local listTop = top + 150
+	local rows = math.max(1, math.floor((H - 16 - listTop) / L.LIST_ROW))
 	self.featListTop = listTop
 	self.featListH = rows * L.LIST_ROW
-	self.featChars = r:Capacity(cw - 24, 12)
+	self.featChars = r:Capacity(cw - 8, 12)
 	for i = 1, rows do
 		local y = listTop + (i - 1) * L.LIST_ROW
-		local slot = { hover = false }
-		slot.bg = r:Rect({ x = cx, y = y, w = cw, h = L.LIST_ROW - 2, token = "bg", group = gGame, z = 3 })
-		slot.label = r:Label({ x = cx + 10, y = y + 4, size = 12, token = "textDim", group = gGame, z = 6 })
-		slot.nodes = { slot.bg, slot.label }
-		slot.region = self:AddRegion({
-			x = cx, y = y, w = cw, h = L.LIST_ROW - 2, group = gGame, z = 4, on = false,
-			onClick = function()
-				if slot.feature then
-					self.selectedFeature = slot.feature.Id
-					self:RefreshFeatures()
-				end
-			end,
-			onEnter = function()
-				slot.hover = true
-				self:RefreshFeatureVisual(slot)
-			end,
-			onLeave = function()
-				slot.hover = false
-				self:RefreshFeatureVisual(slot)
-			end,
-			tooltip = function()
-				local f = slot.feature
-				if f and f.Description ~= "" then
-					return f.Description
-				end
-				return nil
-			end,
-		})
-		self.featSlots[i] = slot
+		self.featSlots[i] = { label = r:Label({ x = cx, y = y + 3, size = 12, token = "text", group = gGame, z = 6 }) }
 	end
 	self.featTrack = r:Rect({ x = W - 10, y = listTop, w = 3, h = self.featListH, token = "border", group = gGame, z = 3 })
 	self.featThumb = r:Rect({ x = W - 10, y = listTop, w = 3, h = 20, token = "textDim", group = gGame, z = 4 })
-	self.featEmpty = r:Label({ x = cx + cw / 2, y = listTop + 10, size = 11, align = "center", token = "muted", group = gGame, z = 6 })
+	self.featEmpty = r:Label({ x = cx, y = listTop + 3, size = 12, token = "muted", group = gGame, z = 6 })
 	self:AddRegion({
 		x = cx, y = listTop, w = cw, h = self.featListH, group = gGame, z = 2,
 		onScroll = function(d)
@@ -1179,10 +1183,6 @@ function UI:Build()
 			self:RefreshFeatures()
 		end,
 	})
-	r:Rect({ x = cx, y = H - 50, w = cw, h = 38, token = "panel", group = gGame, z = 3 })
-	r:Rect({ x = cx, y = H - 50, w = cw, h = 38, filled = false, token = "border", group = gGame, z = 4 })
-	self.detailChars = r:Capacity(cw - 24, 11)
-	self.detailLbl = r:Label({ x = cx + 12, y = H - 38, size = 11, token = "muted", group = gGame, z = 6 })
 
 	-- toasts -------------------------------------------------------------
 	self.toastChars = r:Capacity(L.TOAST_W - 24, 10)
@@ -1519,9 +1519,6 @@ function UI:RefreshSlotVisual(slot)
 	slot.initial:SetToken(selected and "text" or "textDim")
 	slot.title:SetToken((selected or hover) and "text" or "textDim")
 	slot.desc:SetToken(live and "live" or (selected and "textDim" or "muted"))
-	slot.dot:SetFilled(true)
-	slot.dot:SetToken("live")
-	slot.dot:Show(live)
 end
 
 local function updateScrollbar(track, thumb, top, height, offset, total, visible)
@@ -1575,23 +1572,30 @@ end
 
 function UI:RefreshWelcome()
 	local lib = self.lib
-	self.welcomeTitle:SetText("Welcome to " .. fit(titleCase(lib._title), 24))
-	local lines = wrapText("Select a game from the library to explore its information and available features.", self.welcomeChars, 2)
+	local w = lib._welcome
+	self.welcomeTitle:SetText(fit(w.Title or ("Welcome to " .. titleCase(lib._title)), self.welcomeTitleChars))
+	local sub = w.Subtitle or "Select a game from the library to explore its information and available features."
+	local lines = wrapText(sub, self.welcomeChars, 2)
 	for i, node in ipairs(self.welcomeLines) do
 		node:SetText(lines[i] or "")
 	end
-	local m0 = lib._matchedId and lib._games[lib._matchedId]
+	local m = lib._matchedId and lib._games[lib._matchedId]
 	local data = {
 		{ "GAMES", tostring(#lib._order) },
-		{ "CURRENT", m0 and m0.Title or "NONE" },
+		{ "CURRENT", m and m.Title or "NONE" },
 		{ "VERSION", cleanVersion(lib._version) },
 	}
 	for i, card in ipairs(self.cards) do
 		card.label:SetText(data[i][1])
 		card.value:SetText(fit(data[i][2], 9))
 	end
-	local m = lib._matchedId and lib._games[lib._matchedId]
 	self.placeHint:SetText(m and fit("Current place matches: " .. m.Title, self.welcomeChars) or "")
+	local b = w.Button
+	self.welcomeBtn:Show(b ~= nil)
+	if b then
+		self.welcomeBtn:SetText(fit(b.Text, self.welcomeBtnChars))
+		self.welcomeBtn:SetEnabled(true)
+	end
 end
 
 function UI:ApplyThumb(img, initial, g)
@@ -1621,28 +1625,29 @@ function UI:RefreshGame(g)
 	self.gameInitial:SetText(g._initial)
 	self:ApplyThumb(self.gameImg, self.gameInitial, g)
 	self.gameTitle:SetText(fit(g.Title, self.gameTitleChars))
+
+	-- second line only exists when there is something to put on it; otherwise the
+	-- title is centred against the icon so no empty gap is left under it
 	local live = lib._matchedId == g.Id
+	local top, tx = self.gameTop, self.gameTextX
+	local infoY = top + 31
+	self.gameTitle:Move(tx, (live or g.Version) and (top + 8) or (top + 16))
 	self.gameLiveDot:Show(live)
 	self.gameLiveLbl:Show(live)
-	self.gameInfo:Move(live and (self.gameTextX + 14 + self.liveW + 14) or self.gameTextX, self.gameInfoY)
+	if live then
+		self.gameLiveDot:Move(tx, infoY + 2)
+		self.gameLiveLbl:Move(tx + 14, infoY)
+	end
+	self.gameInfo:Move(live and (tx + 14 + self.liveW + 14) or tx, infoY)
 	self.gameInfo:SetText(g.Version and fit("v" .. cleanVersion(g.Version), self.infoChars) or "")
+
 	self.runBtn:SetEnabled(lib:_hasScript(g))
 	local desc = (g.Description and g.Description ~= "") and g.Description or "No description provided."
 	local lines = wrapText(desc, self.descChars, #self.descLines)
 	for i, node in ipairs(self.descLines) do
 		node:SetText(lines[i] or "")
 	end
-	self.featCountLbl:SetText(#g.Features .. (#g.Features == 1 and " ITEM" or " ITEMS"))
-end
-
-function UI:RefreshFeatureVisual(slot)
-	local f = slot.feature
-	if not f then
-		return
-	end
-	local selected = self.selectedFeature == f.Id
-	slot.bg:SetToken(selected and "panel2" or (slot.hover and "hover" or "bg"))
-	slot.label:SetToken(f.Enabled and ((selected or slot.hover) and "text" or "textDim") or "muted")
+	self.featCountLbl:SetText(tostring(#g.Features))
 end
 
 function UI:RefreshFeatures()
@@ -1656,38 +1661,20 @@ function UI:RefreshFeatures()
 	self.featOffset = clamp(self.featOffset, 0, math.max(0, #list - n))
 	for i, slot in ipairs(self.featSlots) do
 		local f = list[self.featOffset + i]
-		slot.feature = f
 		if f then
-			slot.label:SetText(fit("- " .. f.Title, self.featChars))
-			for _, node in ipairs(slot.nodes) do
-				node:Show(true)
-			end
-			slot.region.on = true
-			self:RefreshFeatureVisual(slot)
+			slot.label:SetText(fit("- " .. f, self.featChars))
+			slot.label:Show(true)
 		else
-			slot.hover = false
-			for _, node in ipairs(slot.nodes) do
-				node:Show(false)
-			end
-			slot.region.on = false
+			slot.label:Show(false)
 		end
 	end
 	updateScrollbar(self.featTrack, self.featThumb, self.featListTop, self.featListH, self.featOffset, #list, n)
 	if #list == 0 then
-		self.featEmpty:SetText("No features listed for this game")
+		self.featEmpty:SetText("No features listed")
 		self.featEmpty:Show(true)
 	else
 		self.featEmpty:Show(false)
 	end
-	local sel = self.selectedFeature and g._featureIndex[self.selectedFeature]
-	if sel then
-		self.detailLbl:SetText(fit(sel.Title .. ": " .. (sel.Description ~= "" and sel.Description or "No description"), self.detailChars))
-		self.detailLbl:SetToken("textDim")
-	else
-		self.detailLbl:SetText("Hover or click a feature for details")
-		self.detailLbl:SetToken("muted")
-	end
-	self:ReHover()
 end
 
 function UI:RefreshContent()
@@ -1695,6 +1682,7 @@ function UI:RefreshContent()
 	local g = lib._games[lib._selectedId]
 	self.r:SetGroupHidden(self.groups.welcome, g ~= nil)
 	self.r:SetGroupHidden(self.groups.game, g == nil)
+	self.btnHome:Show(g ~= nil)
 	if g then
 		self:RefreshGame(g)
 		self:RefreshFeatures()
@@ -1704,6 +1692,7 @@ function UI:RefreshContent()
 	else
 		self:RefreshWelcome()
 	end
+	self:ReHover()
 end
 
 function UI:RefreshAll()
@@ -1815,27 +1804,13 @@ end
 
 -- validation ---------------------------------------------------------------
 local function normaliseFeature(def)
-	if type(def) == "string" then
-		def = { Title = def }
+	if type(def) == "table" then
+		def = def.Title
 	end
-	if type(def) ~= "table" then
-		return nil, "a feature must be a string or a table"
+	if not isString(def) then
+		return nil, "each feature must be a non-empty string"
 	end
-	if not isString(def.Title) and not isString(def.Id) then
-		return nil, "a feature needs a Title or an Id"
-	end
-	if def.Description ~= nil and type(def.Description) ~= "string" then
-		return nil, "feature Description must be a string"
-	end
-	local f = shallowCopy(def)
-	f.Title = isString(def.Title) and trim(def.Title) or trim(def.Id)
-	f.Id = isString(def.Id) and trim(def.Id) or slugify(f.Title)
-	if f.Id == "" then
-		return nil, "could not derive a feature id"
-	end
-	f.Description = def.Description or ""
-	f.Enabled = def.Enabled ~= false
-	return f
+	return trim(def)
 end
 
 local function normalisePlaceIds(v)
@@ -1883,8 +1858,12 @@ function UniversalLibrary.new(config)
 	self._themeName, self._themeOverrides = "Monochrome", {}
 	self._theme = resolveTheme("Monochrome", {})
 	self._ui = nil
+	self._welcome = {}
 	if config.Theme ~= nil then
 		self:SetTheme(config.Theme)
+	end
+	if config.Welcome ~= nil then
+		self:SetWelcome(config.Welcome)
 	end
 	return self
 end
@@ -1905,6 +1884,49 @@ function Library:SetSubtitle(subtitle)
 	self._subtitle = subtitle
 	self:_refresh("Header")
 	return self
+end
+
+function Library:SetWelcome(config)
+	if type(config) ~= "table" then
+		return self:_fail("SetWelcome", "config must be a table")
+	end
+	local w = self._welcome
+	if config.Title ~= nil then
+		if type(config.Title) ~= "string" then
+			return self:_fail("SetWelcome", "Title must be a string")
+		end
+		w.Title = config.Title ~= "" and config.Title or nil
+	end
+	if config.Subtitle ~= nil then
+		if type(config.Subtitle) ~= "string" then
+			return self:_fail("SetWelcome", "Subtitle must be a string")
+		end
+		w.Subtitle = config.Subtitle ~= "" and config.Subtitle or nil
+	end
+	if config.Button ~= nil then
+		local b = config.Button
+		if b == false then
+			w.Button = nil
+		elseif type(b) == "table" and isString(b.Text) and (b.Callback == nil or type(b.Callback) == "function") then
+			w.Button = { Text = trim(b.Text), Callback = b.Callback }
+		else
+			return self:_fail("SetWelcome", "Button must be { Text = string, Callback = function } or false")
+		end
+	end
+	self:_refresh("Welcome")
+	return self
+end
+
+function Library:_welcomeAction()
+	local b = self._welcome.Button
+	if b and type(b.Callback) == "function" then
+		task.spawn(function()
+			local ok, err = pcall(b.Callback, self)
+			if not ok then
+				self:_log("error", "Welcome button failed: " .. tostring(err))
+			end
+		end)
+	end
 end
 
 function Library:SetTheme(config)
@@ -1944,33 +1966,14 @@ function Library:SetTheme(config)
 	return self
 end
 
-function Library:GetGame(id)
-	return type(id) == "string" and self._games[id] or nil
-end
-
 function Library:AddGame(config)
 	if type(config) ~= "table" then
 		return self:_fail("AddGame", "config must be a table")
 	end
-	local title = isString(config.Title) and trim(config.Title) or (isString(config.Id) and trim(config.Id) or nil)
-	if not title then
-		return self:_fail("AddGame", "a Title (or Id) is required")
+	if not isString(config.Title) then
+		return self:_fail("AddGame", "a Title is required")
 	end
-	local id
-	if config.Id ~= nil then
-		if not isString(config.Id) then
-			return self:_fail("AddGame", "Id must be a non-empty string")
-		end
-		id = trim(config.Id)
-	else
-		id = slugify(title)
-		if id == "" then
-			return self:_fail("AddGame", "could not generate an Id from the Title; supply one")
-		end
-	end
-	if self._games[id] then
-		return self:_fail("AddGame", "duplicate game id '" .. id .. "'")
-	end
+	local title = trim(config.Title)
 	if config.Description ~= nil and type(config.Description) ~= "string" then
 		return self:_fail("AddGame", "Description must be a string")
 	end
@@ -1993,35 +1996,38 @@ function Library:AddGame(config)
 	if config.Features ~= nil and type(config.Features) ~= "table" then
 		return self:_fail("AddGame", "Features must be a list")
 	end
+	local features = {}
+	for _, d in ipairs(config.Features or {}) do
+		local f, err = normaliseFeature(d)
+		if not f then
+			return self:_fail("AddGame", "'" .. title .. "': " .. err)
+		end
+		features[#features + 1] = f
+	end
+
+	-- internal key only (never shown): slug of the title, made unique so two
+	-- entries with the same title can coexist
+	local base = slugify(title)
+	if base == "" then
+		base = "game"
+	end
+	local id, n = base, 1
+	while self._games[id] do
+		n = n + 1
+		id = base .. "-" .. n
+	end
 
 	local g = shallowCopy(config)
 	g.Id, g.Title = id, title
 	g.Description = config.Description or ""
-	g.Enabled = true
 	g.PlaceIds = placeIds
 	g.Version = config.Version ~= nil and tostring(config.Version) or nil
-	g.Features, g._featureIndex = {}, {}
+	g.Features = features
 	g._initial = (config.Icon and #config.Icon > 0 and #config.Icon <= 3) and config.Icon
 		or (title:match("%w") or "?"):upper()
-	g._search = (title .. " " .. id .. " " .. g.Description):lower()
+	g._search = (title .. " " .. g.Description):lower()
 	local thumbId = tonumber(config.IconPlaceId) or (placeIds and placeIds[1])
 	g._thumbPlace = thumbId and math.floor(thumbId) or nil
-
-	local defs = {}
-	for _, d in ipairs(config.Features or {}) do
-		defs[#defs + 1] = d
-	end
-	for _, d in ipairs(defs) do
-		local f, err = normaliseFeature(d)
-		if not f then
-			return self:_fail("AddGame", "game '" .. id .. "': " .. err)
-		end
-		if g._featureIndex[f.Id] then
-			return self:_fail("AddGame", "game '" .. id .. "': duplicate feature id '" .. f.Id .. "'")
-		end
-		g._featureIndex[f.Id] = f
-		g.Features[#g.Features + 1] = f
-	end
 
 	self._games[id] = g
 	self._order[#self._order + 1] = id
@@ -2030,47 +2036,6 @@ function Library:AddGame(config)
 	self:_log("info", "Registered " .. title)
 	self:_refresh("List", "Content")
 	return g
-end
-
-function Library:RemoveGame(id)
-	local g = type(id) == "string" and self._games[id] or nil
-	if not g then
-		self:_log("warn", "RemoveGame: unknown game '" .. tostring(id) .. "'")
-		return false
-	end
-	if self._selectedId == id then
-		self:SelectGame(nil)
-	end
-	self._games[id] = nil
-	local idx = table.find(self._order, id)
-	if idx then
-		table.remove(self._order, idx)
-	end
-	self:_computeMatch()
-	self:_rebuildFilter()
-	self:_log("info", "Removed " .. g.Title)
-	self:_refresh("List", "Content")
-	return true
-end
-
-function Library:AddFeature(gameId, feature)
-	local g = type(gameId) == "string" and self._games[gameId] or nil
-	if not g then
-		return self:_fail("AddFeature", "unknown game '" .. tostring(gameId) .. "'")
-	end
-	local f, err = normaliseFeature(feature)
-	if not f then
-		return self:_fail("AddFeature", err)
-	end
-	if g._featureIndex[f.Id] then
-		return self:_fail("AddFeature", "duplicate feature id '" .. f.Id .. "' for game '" .. gameId .. "'")
-	end
-	g._featureIndex[f.Id] = f
-	g.Features[#g.Features + 1] = f
-	if self._selectedId == gameId then
-		self:_refresh("Content")
-	end
-	return f
 end
 
 function Library:Notify(config)
@@ -2094,12 +2059,6 @@ function Library:Notify(config)
 		ui:PumpToasts()
 	end
 	return true
-end
-
-function Library:SetVisible(b)
-	if self._ui and not self._ui.dead then
-		self._ui:SetVisible(b == true)
-	end
 end
 
 -- selecting and running ---------------------------------------------------------
@@ -2128,17 +2087,10 @@ function Library:_hasScript(g)
 	return resolveRunner(g) ~= nil
 end
 
-function Library:SelectGame(id)
-	if id ~= nil and type(id) ~= "string" then
-		return self:_fail("SelectGame", "id must be a string or nil")
-	end
-	local g
-	if id ~= nil then
-		g = self._games[id]
-		if not g then
-			self:_log("warn", "SelectGame: unknown game '" .. id .. "'")
-			return false, "unknown game"
-		end
+function Library:_selectGame(id)
+	local g = id ~= nil and self._games[id] or nil
+	if id ~= nil and not g then
+		return false
 	end
 	if self._selectedId == id then
 		return true
@@ -2146,7 +2098,6 @@ function Library:SelectGame(id)
 	self._selectedId = id
 	if self._ui and not self._ui.dead then
 		self._ui.featOffset = 0
-		self._ui.selectedFeature = nil
 	end
 	self:_refresh("List", "Content")
 	if g and type(g.Callback) == "function" then
@@ -2176,16 +2127,6 @@ function Library:_runGame(g)
 			warn(LOG_TAG, title .. " failed to run: " .. tostring(err))
 		end
 	end)
-end
-
-function Library:RunGame(id)
-	local g = self:GetGame(id)
-	if not g then
-		self:_log("warn", "RunGame: unknown game '" .. tostring(id) .. "'")
-		return false
-	end
-	self:_runGame(g)
-	return true
 end
 
 -- init / destroy ------------------------------------------------------------------
@@ -2237,7 +2178,7 @@ function Library:Init()
 	ui:RefreshAll()
 	self:_log("ok", "Initialised v" .. cleanVersion(self._version))
 	if self._autoSelect and self._matchedId then
-		self:SelectGame(self._matchedId)
+		self:_selectGame(self._matchedId)
 	end
 	return true
 end
