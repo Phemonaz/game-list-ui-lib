@@ -46,6 +46,13 @@
    Library:Init() -> bool, err        Library:Destroy([clearRegistry])
    Extras: Library:SetVisible(bool), Library:RunGame(id), UniversalLibrary.GetCapabilities()
 
+ THIS IS A SCRIPT LOADER
+   The library only lists games and launches the script you attach to each one.
+   It does not enable, disable, toggle or manage anything. Pressing RUN closes
+   the whole UI (everything is destroyed and unhooked first) and then executes
+   your script in a fresh, pcall-protected thread. If the script errors, the
+   error is printed with warn() because the UI is already gone.
+
  AddGame(config) FIELDS
    Id           string   unique. If omitted it is generated from Title:
                          lower-case, runs of non-alphanumerics become "-",
@@ -53,48 +60,32 @@
                          or generated) is rejected, never silently replaced.
    Title        string   display name (falls back to Id).
    Description  string   short summary.
-   PlaceIds     number | {number}   optional. The FIRST id is used to download
-                         the game's thumbnail for the icon box; all ids are used
-                         for current-place detection.
+   PlaceIds     number | {number}   place ids of the game. Used for current-game
+                         detection; the FIRST id also supplies the thumbnail.
    IconPlaceId  number   optional, overrides which place the thumbnail comes from.
-   Version      string   optional module version.
-   Enabled      bool     default true. Disabled games can be viewed but not run.
+   Version      string   optional, shown in the game header.
    Icon         string   optional, up to 3 characters shown if no thumbnail loads.
-   Callback     function(game)   called after the user selects the game.
-   Run          function(game)   called when the user presses RUN (see below).
-   Features     { "Name", ... } or { {Id, Title, Description, Enabled}, ... }
-   Module       { Initialize(context), Cleanup(), Features = {...}, Settings = {...} }
+   Features     { "Name", ... } or { {Title, Description}, ... }  display-only list.
+   Run          function(game)   what the RUN button executes. Put your loadstring
+                         here, e.g.
+                           Run = function()
+                               loadstring(game:HttpGet("https://.../script.lua"))()
+                           end
+   Script       string | function   shorthand for Run. A string is treated as a URL:
+                         it is downloaded with game:HttpGet, compiled with
+                         loadstring and executed. A function behaves like Run.
+   Callback     function(game)   optional, called when the entry is selected
+                         (selecting never runs the script).
    Any other keys are kept on the game table (forward compatible).
+   RUN is disabled for an entry that has neither Run nor Script.
 
- FEATURES
-   Features are a plain, read-only list under the game description (hover for
-   the description, click to pin it at the bottom). They are labels: the UI never
-   executes them, and there are no per-feature buttons or toggles.
-
- RUN BUTTON
-   The RUN button next to the game title starts the game:
-     * with a Module, Initialize(context) runs first (async); when it succeeds
-       the button becomes STOP, and pressing STOP runs Cleanup
-     * Run(game) then runs in its own pcall'd thread (after Initialize, if any).
-       This is the place to load or start your own script.
-     * a failure shows a notification and sets the header status to ERROR
-   The button is disabled for games with neither Run nor Module, and for
-   disabled games.
-
- MODULE CONTRACT / LIFECYCLE
-   Press RUN on an enabled game with a Module:
-     1. Initialize(context) runs in a separate thread (the UI stays responsive);
-        the button shows STARTING, then STOP (or RUN again if it FAILED)
-     2. the game's Run function runs, if there is one
-   Press STOP, switch to another game, deselect, remove the game, or Destroy():
-     Cleanup() runs (only if Initialize succeeded), then everything added to
-     context.Janitor is released. If you switch away while Initialize is still
-     running, cleanup happens as soon as it returns.
-   context = { Library, Game, Janitor, Settings, PlaceId, Log(msg, level),
-               Notify(cfg), IsActive() }
-   context.Janitor:Add(item) / :Connect(signal, fn) accepts connections,
-   Instances, functions, threads and tables with Destroy/Disconnect, so module
-   code cannot leak connections.
+ CURRENT GAME DETECTION
+   On Init (and whenever games are added or removed) game.PlaceId is compared with
+   every entry's PlaceIds. A match gets a green "CURRENT GAME" indicator in the
+   list and in its header, and is always sorted to the top of the list (even while
+   searching). Detection can be switched off with AutoDetect = false, and
+   AutoSelect = true selects the matching entry automatically. Browsing and
+   selecting any other entry always works.
 
  LOADING / DISTRIBUTION (the registrations below never change between methods)
    A. Local standalone: loadstring(readfile("UniversalLibrary.lua"))() returns
@@ -116,10 +107,10 @@
  ADDING ANOTHER GAME
    Library:AddGame({
        Id = "my-game", Title = "My Game", Description = "What it does",
-       PlaceIds = { 1234567890 },          -- thumbnail + current-place detection
+       PlaceIds = { 1234567890 },          -- current-game detection + thumbnail
        Features = { "Feature one", "Feature two" },
-       Run = function(entry)
-           -- start your own script here
+       Run = function()
+           loadstring(game:HttpGet("https://example.com/my-game.lua"))()
        end,
    })
    No UI code needs to change; the sidebar and detail panel update automatically.
@@ -475,6 +466,7 @@ local Themes = {
 		textDim = "#999999",
 		hover = "#242424",
 		muted = "#6B6B6B",
+		live = "#3DDC84",
 	},
 	Inverted = {
 		bg = "#F4F4F4",
@@ -485,12 +477,13 @@ local Themes = {
 		textDim = "#555555",
 		hover = "#D6D6D6",
 		muted = "#8A8A8A",
+		live = "#1E9E55",
 	},
 }
 
 local THEME_LOOKUP = {
 	bg = "bg", panel = "panel", panel2 = "panel2", border = "border",
-	text = "text", textdim = "textDim", hover = "hover", muted = "muted",
+	text = "text", textdim = "textDim", hover = "hover", muted = "muted", live = "live",
 }
 
 local function resolveTheme(name, overrides)
@@ -857,7 +850,7 @@ function UI.new(lib, caps)
 	self.welcomeLines = {}
 	self.listOffset, self.featOffset = 0, 0
 	self.tipToken, self.filterToken = 0, 0
-	self.minimized, self.focused, self.dead = false, false, false
+	self.focused, self.dead = false, false
 	self.r = Renderer.new(caps, lib._theme)
 	self.r:MeasureFont()
 	local vp = viewportSize()
@@ -1005,14 +998,6 @@ function UI:Build()
 	self.titleLbl = r:Label({ x = 14, y = 8, size = 14, token = "text", group = gHeader, z = 6 })
 	self.versionLbl = r:Label({ x = 100, y = 11, size = 10, token = "muted", group = gHeader, z = 6 })
 	self.subtitleLbl = r:Label({ x = 14, y = 27, size = 10, token = "textDim", group = gHeader, z = 6 })
-	self.statusAnchor = W - 62 - 16
-	self.statusDot = r:Rect({ x = 0, y = 20, w = 6, h = 6, token = "text", group = gHeader, z = 6 })
-	self.statusLbl = r:Label({ x = self.statusAnchor, y = 16, size = 10, align = "right", token = "text", group = gHeader, z = 6 })
-	self.btnMin = self:Button({
-		x = W - 62, y = 11, w = 24, h = 24, text = "-", group = gHeader, z = 6,
-		onClick = function() self:ToggleMinimize() end,
-		tooltip = function() return self.minimized and "Restore" or "Minimize" end,
-	})
 	self.btnClose = self:Button({
 		x = W - 34, y = 11, w = 24, h = 24, text = "x", group = gHeader, z = 6,
 		onClick = function() lib:Destroy() end, tooltip = "Close",
@@ -1071,10 +1056,7 @@ function UI:Build()
 				if not g then
 					return nil
 				end
-				if lib._matchedId == g.Id then
-					return g.Title .. " - matches the current place"
-				end
-				return g.Title .. (g.Enabled and " - available" or " - unavailable")
+				return lib._matchedId == g.Id and (g.Title .. " - you are in this game") or g.Title
 			end,
 		})
 		self.slots[i] = slot
@@ -1121,6 +1103,10 @@ function UI:Build()
 	self.gameTitle = r:Label({ x = textX, y = top + 6, size = 18, token = "text", group = gGame, z = 6 })
 	self.infoChars = r:Capacity(titlePx, 10)
 	self.gameInfo = r:Label({ x = textX, y = top + 32, size = 10, token = "textDim", group = gGame, z = 6 })
+	self.gameTextX, self.gameInfoY = textX, top + 32
+	self.liveW = r:TextWidth("CURRENT GAME", 10)
+	self.gameLiveDot = r:Rect({ x = textX, y = top + 34, w = 6, h = 6, token = "live", group = gGame, z = 6 })
+	self.gameLiveLbl = r:Label({ x = textX + 14, y = top + 32, size = 10, text = "CURRENT GAME", token = "live", group = gGame, z = 6 })
 	self.runBtn = self:Button({
 		x = cx + cw - runW, y = top + 12, w = runW, h = 28, text = "RUN", size = 12, group = gGame, z = 7,
 		onClick = function()
@@ -1134,13 +1120,7 @@ function UI:Build()
 			if not g then
 				return nil
 			end
-			if not g.Enabled then
-				return "Unavailable"
-			end
-			if type(g.Run) ~= "function" and type(g.Module) ~= "table" then
-				return "No script attached"
-			end
-			return g._moduleState == "active" and "Stop and clean up" or "Run this game's script"
+			return lib:_hasScript(g) and "Run this script and close the loader" or "No script attached"
 		end,
 	})
 	self.descChars = r:Capacity(cw, 12)
@@ -1297,7 +1277,7 @@ function UI:OnInputChanged(input)
 		local m = UserInputService:GetMouseLocation()
 		if self.drag then
 			local vp = viewportSize()
-			local h = self.minimized and L.HEADER or L.H
+			local h = L.H
 			self.r:SetOrigin(
 				clamp(m.X - self.drag.dx, 0, math.max(0, vp.X - L.W)),
 				clamp(m.Y - self.drag.dy, 0, math.max(0, vp.Y - h))
@@ -1388,24 +1368,11 @@ function UI:ClampWindow()
 		return
 	end
 	local vp = viewportSize()
-	local h = self.minimized and L.HEADER or L.H
+	local h = L.H
 	self.r:SetOrigin(
 		clamp(self.r.ox, 0, math.max(0, vp.X - L.W)),
 		clamp(self.r.oy, 0, math.max(0, vp.Y - h))
 	)
-end
-
-function UI:ToggleMinimize()
-	self.minimized = not self.minimized
-	self:SetFocus(false)
-	self:HideTooltip()
-	self.r:SetGroupHidden(self.groups.body, self.minimized)
-	local h = self.minimized and L.HEADER or L.H
-	self.frameBg:Resize(L.W, h)
-	self.frameBorder:Resize(L.W, h)
-	self.btnMin:SetText(self.minimized and "+" or "-")
-	self:ClampWindow()
-	self:ReHover()
 end
 
 function UI:SetVisible(b)
@@ -1422,9 +1389,6 @@ end
 
 function UI:Show()
 	self:SetVisible(true)
-	if self.minimized then
-		self:ToggleMinimize()
-	end
 end
 
 -- Tooltip ----------------------------------------------------------------------
@@ -1518,19 +1482,6 @@ function UI:RefreshHeader()
 	self.subtitleLbl:SetText(fit(lib._subtitle, 60))
 	self.versionLbl:SetText("v" .. cleanVersion(lib._version))
 	self.versionLbl:Move(14 + r:TextWidth(title, 14) + 8, 11)
-	self:RefreshStatus()
-	self.btnMin:SetText(self.minimized and "+" or "-")
-end
-
-function UI:RefreshStatus()
-	local st = self.lib._status
-	local text = fit(string.upper(st.text), 12)
-	self.statusLbl:SetText(text)
-	self.statusDot:Move(self.statusAnchor - self.r:TextWidth(text, 10) - 12, 20)
-	local tok = st.kind == "busy" and "textDim" or "text"
-	self.statusDot:SetFilled(st.kind ~= "error")
-	self.statusDot:SetToken(tok)
-	self.statusLbl:SetToken(tok)
 end
 
 function UI:RefreshSearch()
@@ -1559,28 +1510,18 @@ function UI:RefreshSlotVisual(slot)
 		return
 	end
 	local selected = lib._selectedId == g.Id
+	local live = lib._matchedId == g.Id
 	local hover = slot.hover
 	local bgTok = selected and "panel2" or (hover and "hover" or "panel")
 	slot.bg:SetToken(bgTok)
-	slot.bar:SetToken(selected and "text" or bgTok)
+	slot.bar:SetToken(selected and "text" or (live and "live" or bgTok))
 	slot.box:SetToken(selected and "text" or "border")
 	slot.initial:SetToken(selected and "text" or "textDim")
-	local titleTok = (selected or hover) and "text" or "textDim"
-	if not g.Enabled then
-		titleTok = "muted"
-	end
-	slot.title:SetToken(titleTok)
-	slot.desc:SetToken(selected and "textDim" or "muted")
-	if lib._matchedId == g.Id then
-		slot.dot:SetFilled(true)
-		slot.dot:SetToken("text")
-	elseif g.Enabled then
-		slot.dot:SetFilled(true)
-		slot.dot:SetToken("textDim")
-	else
-		slot.dot:SetFilled(false)
-		slot.dot:SetToken("muted")
-	end
+	slot.title:SetToken((selected or hover) and "text" or "textDim")
+	slot.desc:SetToken(live and "live" or (selected and "textDim" or "muted"))
+	slot.dot:SetFilled(true)
+	slot.dot:SetToken("live")
+	slot.dot:Show(live)
 end
 
 local function updateScrollbar(track, thumb, top, height, offset, total, visible)
@@ -1611,7 +1552,7 @@ function UI:RefreshList()
 			slot.id = g.Id
 			slot.initial:SetText(g._initial)
 			slot.title:SetText(fit(g.Title, self.rowTitleChars))
-			slot.desc:SetText(fit(g.Description or "", self.rowDescChars))
+			slot.desc:SetText(lib._matchedId == g.Id and "CURRENT GAME" or fit(g.Description or "", self.rowDescChars))
 			self:SetSlotShown(slot, true)
 			self:ApplyThumb(slot.img, slot.initial, g)
 			self:RefreshSlotVisual(slot)
@@ -1639,15 +1580,10 @@ function UI:RefreshWelcome()
 	for i, node in ipairs(self.welcomeLines) do
 		node:SetText(lines[i] or "")
 	end
-	local modules = 0
-	for _, g in pairs(lib._games) do
-		if g.Module and g.Enabled then
-			modules = modules + 1
-		end
-	end
+	local m0 = lib._matchedId and lib._games[lib._matchedId]
 	local data = {
 		{ "GAMES", tostring(#lib._order) },
-		{ "MODULES", tostring(modules) },
+		{ "CURRENT", m0 and m0.Title or "NONE" },
 		{ "VERSION", cleanVersion(lib._version) },
 	}
 	for i, card in ipairs(self.cards) do
@@ -1681,44 +1617,16 @@ function UI:ApplyThumb(img, initial, g)
 end
 
 function UI:RefreshGame(g)
+	local lib = self.lib
 	self.gameInitial:SetText(g._initial)
 	self:ApplyThumb(self.gameImg, self.gameInitial, g)
 	self.gameTitle:SetText(fit(g.Title, self.gameTitleChars))
-	local state = g._moduleState
-	local parts = {}
-	if not g.Enabled then
-		parts[#parts + 1] = "UNAVAILABLE"
-	elseif state == "active" or g._running then
-		parts[#parts + 1] = "RUNNING"
-	elseif state == "initializing" then
-		parts[#parts + 1] = "STARTING"
-	elseif state == "failed" then
-		parts[#parts + 1] = "FAILED"
-	else
-		parts[#parts + 1] = "READY"
-	end
-	if g.Version then
-		parts[#parts + 1] = "v" .. cleanVersion(g.Version)
-	end
-	if self.lib._matchedId == g.Id then
-		parts[#parts + 1] = "CURRENT PLACE"
-	end
-	self.gameInfo:SetText(fit(table.concat(parts, "  |  "), self.infoChars))
-
-	-- RUN / STOP button
-	local hasScript = type(g.Run) == "function" or type(g.Module) == "table"
-	local label, enabled, active = "RUN", g.Enabled and hasScript, false
-	if g._running then
-		label, enabled = "RUNNING", false
-	elseif state == "initializing" then
-		label, enabled = "STARTING", false
-	elseif state == "active" then
-		label, enabled, active = "STOP", g.Enabled, true
-	end
-	self.runBtn:SetText(label)
-	self.runBtn:SetActive(active)
-	self.runBtn:SetEnabled(enabled and true or false)
-
+	local live = lib._matchedId == g.Id
+	self.gameLiveDot:Show(live)
+	self.gameLiveLbl:Show(live)
+	self.gameInfo:Move(live and (self.gameTextX + 14 + self.liveW + 14) or self.gameTextX, self.gameInfoY)
+	self.gameInfo:SetText(g.Version and fit("v" .. cleanVersion(g.Version), self.infoChars) or "")
+	self.runBtn:SetEnabled(lib:_hasScript(g))
 	local desc = (g.Description and g.Description ~= "") and g.Description or "No description provided."
 	local lines = wrapText(desc, self.descChars, #self.descLines)
 	for i, node in ipairs(self.descLines) do
@@ -1873,27 +1781,17 @@ function Library:_refresh(...)
 	end
 end
 
-function Library:_setStatus(kind, text, ttl)
-	self._status = { kind = kind, text = text }
-	self._statusToken = self._statusToken + 1
-	local token = self._statusToken
-	if ttl then
-		task.delay(ttl, function()
-			if self._statusToken == token then
-				self._status = { kind = "ready", text = "READY" }
-				self:_refresh("Status")
-			end
-		end)
-	end
-	self:_refresh("Status")
-end
-
 function Library:_rebuildFilter()
 	local q = self._query:lower()
 	local out = {}
+	local matched = self._matchedId
+	local mg = matched and self._games[matched]
+	if mg and (q == "" or mg._search:find(q, 1, true)) then
+		out[1] = matched -- the game you are currently in always comes first
+	end
 	for _, id in ipairs(self._order) do
 		local g = self._games[id]
-		if q == "" or g._search:find(q, 1, true) then
+		if id ~= matched and (q == "" or g._search:find(q, 1, true)) then
 			out[#out + 1] = id
 		end
 	end
@@ -1982,8 +1880,6 @@ function UniversalLibrary.new(config)
 	self._query = ""
 	self._logs = {}
 	self._toastQueue = {}
-	self._status = { kind = "ready", text = "READY" }
-	self._statusToken = 0
 	self._themeName, self._themeOverrides = "Monochrome", {}
 	self._theme = resolveTheme("Monochrome", {})
 	self._ui = nil
@@ -2084,24 +1980,15 @@ function Library:AddGame(config)
 	if config.Run ~= nil and type(config.Run) ~= "function" then
 		return self:_fail("AddGame", "Run must be a function")
 	end
+	if config.Script ~= nil and type(config.Script) ~= "function" and not isString(config.Script) then
+		return self:_fail("AddGame", "Script must be a URL string or a function")
+	end
 	if config.Icon ~= nil and type(config.Icon) ~= "string" then
 		return self:_fail("AddGame", "Icon must be a string")
 	end
 	local placeIds, perr = normalisePlaceIds(config.PlaceIds or config.PlaceId)
 	if perr then
 		return self:_fail("AddGame", perr)
-	end
-	local mod = config.Module
-	if mod ~= nil then
-		if type(mod) ~= "table" then
-			return self:_fail("AddGame", "Module must be a table")
-		end
-		if mod.Initialize ~= nil and type(mod.Initialize) ~= "function" then
-			return self:_fail("AddGame", "Module.Initialize must be a function")
-		end
-		if mod.Cleanup ~= nil and type(mod.Cleanup) ~= "function" then
-			return self:_fail("AddGame", "Module.Cleanup must be a function")
-		end
 	end
 	if config.Features ~= nil and type(config.Features) ~= "table" then
 		return self:_fail("AddGame", "Features must be a list")
@@ -2110,27 +1997,19 @@ function Library:AddGame(config)
 	local g = shallowCopy(config)
 	g.Id, g.Title = id, title
 	g.Description = config.Description or ""
-	g.Enabled = config.Enabled ~= false
+	g.Enabled = true
 	g.PlaceIds = placeIds
-	g.Version = config.Version ~= nil and tostring(config.Version) or (mod and mod.Version ~= nil and tostring(mod.Version)) or nil
-	g.Settings = config.Settings or (mod and mod.Settings) or {}
+	g.Version = config.Version ~= nil and tostring(config.Version) or nil
 	g.Features, g._featureIndex = {}, {}
 	g._initial = (config.Icon and #config.Icon > 0 and #config.Icon <= 3) and config.Icon
 		or (title:match("%w") or "?"):upper()
 	g._search = (title .. " " .. id .. " " .. g.Description):lower()
-	g._moduleState = mod and "idle" or "none"
-	g._running = false
 	local thumbId = tonumber(config.IconPlaceId) or (placeIds and placeIds[1])
 	g._thumbPlace = thumbId and math.floor(thumbId) or nil
 
 	local defs = {}
 	for _, d in ipairs(config.Features or {}) do
 		defs[#defs + 1] = d
-	end
-	if mod and type(mod.Features) == "table" then
-		for _, d in ipairs(mod.Features) do
-			defs[#defs + 1] = d
-		end
 	end
 	for _, d in ipairs(defs) do
 		local f, err = normaliseFeature(d)
@@ -2146,8 +2025,8 @@ function Library:AddGame(config)
 
 	self._games[id] = g
 	self._order[#self._order + 1] = id
-	self:_rebuildFilter()
 	self:_computeMatch()
+	self:_rebuildFilter()
 	self:_log("info", "Registered " .. title)
 	self:_refresh("List", "Content")
 	return g
@@ -2162,14 +2041,13 @@ function Library:RemoveGame(id)
 	if self._selectedId == id then
 		self:SelectGame(nil)
 	end
-	self:_stopModule(g)
 	self._games[id] = nil
 	local idx = table.find(self._order, id)
 	if idx then
 		table.remove(self._order, idx)
 	end
-	self:_rebuildFilter()
 	self:_computeMatch()
+	self:_rebuildFilter()
 	self:_log("info", "Removed " .. g.Title)
 	self:_refresh("List", "Content")
 	return true
@@ -2224,89 +2102,30 @@ function Library:SetVisible(b)
 	end
 end
 
--- module lifecycle -------------------------------------------------------------
-function Library:_makeContext(g, janitor)
-	return {
-		Library = self,
-		Game = g,
-		Janitor = janitor,
-		Settings = g.Settings,
-		PlaceId = game.PlaceId,
-		Log = function(msg, level)
-			self:_log(level or "info", msg)
-		end,
-		Notify = function(cfg)
-			self:Notify(cfg)
-		end,
-		IsActive = function()
-			return g._janitor == janitor
-		end,
-	}
+-- selecting and running ---------------------------------------------------------
+local function resolveRunner(g)
+	if type(g.Run) == "function" then
+		return g.Run
+	end
+	local sc = g.Script
+	if type(sc) == "function" then
+		return sc
+	end
+	if type(sc) == "string" and sc ~= "" then
+		return function()
+			local src = game:HttpGet(sc)
+			local fn, err = loadstring(src, "=" .. g.Title)
+			if not fn then
+				error(err, 0)
+			end
+			return fn()
+		end
+	end
+	return nil
 end
 
-function Library:_startModule(g, onReady)
-	local mod = g.Module
-	if type(mod) ~= "table" then
-		g._moduleState = "none"
-		return
-	end
-	if g._moduleState == "initializing" or g._moduleState == "active" then
-		return
-	end
-	local token = {}
-	local janitor = Janitor.new()
-	g._token, g._janitor = token, janitor
-	g._moduleState = "initializing"
-	self:_setStatus("busy", "BUSY") -- set before spawning: Initialize may finish synchronously
-	task.spawn(function()
-		local ok, err = true, nil
-		if type(mod.Initialize) == "function" then
-			ok, err = pcall(mod.Initialize, self:_makeContext(g, janitor))
-		end
-		if g._token ~= token then
-			-- selection moved on while Initialize was running
-			if ok and type(mod.Cleanup) == "function" then
-				pcall(mod.Cleanup)
-			end
-			janitor:Cleanup()
-			return
-		end
-		if ok then
-			g._moduleState = "active"
-			self:_log("ok", g.Title .. " module ready")
-			self:_setStatus("ready", "READY")
-			if onReady then
-				task.spawn(onReady)
-			end
-		else
-			g._moduleState = "failed"
-			janitor:Cleanup()
-			g._janitor = nil
-			self:_log("error", g.Title .. " module failed: " .. tostring(err))
-			self:Notify({ Title = g.Title, Message = "Module failed: " .. tostring(err) })
-			self:_setStatus("error", "ERROR", 4)
-		end
-		if self._selectedId == g.Id then
-			self:_refresh("Content")
-		end
-	end)
-end
-
-function Library:_stopModule(g)
-	local state = g._moduleState
-	g._token = nil -- invalidates a pending Initialize
-	if state == "active" and type(g.Module) == "table" and type(g.Module.Cleanup) == "function" then
-		local ok, err = pcall(g.Module.Cleanup)
-		if not ok then
-			self:_log("error", g.Title .. " cleanup failed: " .. tostring(err))
-		end
-	end
-	if g._janitor then
-		g._janitor:Cleanup()
-		g._janitor = nil
-	end
-	g._moduleState = g.Module and "idle" or "none"
-	-- features that were mid-run keep their own pcall; reset toggles that depended on the module
+function Library:_hasScript(g)
+	return resolveRunner(g) ~= nil
 end
 
 function Library:SelectGame(id)
@@ -2324,83 +2143,39 @@ function Library:SelectGame(id)
 	if self._selectedId == id then
 		return true
 	end
-	local prev = self._games[self._selectedId]
-	if prev then
-		self:_stopModule(prev)
-	end
 	self._selectedId = id
 	if self._ui and not self._ui.dead then
 		self._ui.featOffset = 0
 		self._ui.selectedFeature = nil
 	end
 	self:_refresh("List", "Content")
-	if g then
-		if g.Enabled then
-			self:_log("info", "Selected " .. g.Title)
-			if type(g.Callback) == "function" then
-				task.spawn(function()
-					local ok, err = pcall(g.Callback, g)
-					if not ok then
-						self:_log("error", g.Title .. " callback failed: " .. tostring(err))
-						self:_setStatus("error", "ERROR", 4)
-					end
-				end)
+	if g and type(g.Callback) == "function" then
+		task.spawn(function()
+			local ok, err = pcall(g.Callback, g)
+			if not ok then
+				self:_log("error", g.Title .. " callback failed: " .. tostring(err))
 			end
-		else
-			self:_log("warn", g.Title .. " is currently unavailable")
-		end
+		end)
 	end
 	return true
 end
 
--- RUN / STOP button. Selecting a game never starts anything; only this does.
+-- RUN: close the whole UI first, then run the attached script. Nothing from the
+-- loader stays alive while the script runs.
 function Library:_runGame(g)
-	if not g.Enabled then
-		self:Notify({ Title = g.Title, Message = "This game is currently unavailable" })
-		return
-	end
-	if g._running or g._moduleState == "initializing" then
-		return
-	end
-	if g._moduleState == "active" then -- STOP
-		self:_stopModule(g)
-		self:_setStatus("ready", "READY")
-		self:_refresh("Content")
-		return
-	end
-	local hasRun = type(g.Run) == "function"
-	if not hasRun and type(g.Module) ~= "table" then
+	local runner = resolveRunner(g)
+	if not runner then
 		self:Notify({ Title = g.Title, Message = "No script is attached to this game" })
 		return
 	end
-	local function execute()
-		if not hasRun then
-			return
+	local title = g.Title
+	self:Destroy()
+	task.spawn(function()
+		local ok, err = pcall(runner, g)
+		if not ok then
+			warn(LOG_TAG, title .. " failed to run: " .. tostring(err))
 		end
-		task.spawn(function()
-			g._running = true
-			self:_setStatus("busy", "BUSY")
-			self:_refresh("Content")
-			local ok, err = pcall(g.Run, g)
-			g._running = false
-			if ok then
-				self:_setStatus("ready", "READY")
-			else
-				self:_log("error", g.Title .. " Run failed: " .. tostring(err))
-				self:Notify({ Title = g.Title, Message = "Run failed: " .. tostring(err) })
-				self:_setStatus("error", "ERROR", 4)
-			end
-			if self._selectedId == g.Id then
-				self:_refresh("Content")
-			end
-		end)
-	end
-	if type(g.Module) == "table" then
-		self:_startModule(g, execute)
-	else
-		execute()
-	end
-	self:_refresh("Content")
+	end)
 end
 
 function Library:RunGame(id)
@@ -2457,8 +2232,8 @@ function Library:Init()
 		return false, tostring(err)
 	end
 	self._ui = ui
-	self:_rebuildFilter()
 	self:_computeMatch()
+	self:_rebuildFilter()
 	ui:RefreshAll()
 	self:_log("ok", "Initialised v" .. cleanVersion(self._version))
 	if self._autoSelect and self._matchedId then
@@ -2472,13 +2247,8 @@ function Library:Destroy(clearRegistry)
 		return
 	end
 	self._destroying = true
-	for _, g in pairs(self._games) do
-		self:_stopModule(g)
-	end
 	self._selectedId = nil
 	self._toastQueue = {}
-	self._statusToken = self._statusToken + 1
-	self._status = { kind = "ready", text = "READY" }
 	local ui = self._ui
 	self._ui = nil
 	if ui then
