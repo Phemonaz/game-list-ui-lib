@@ -659,7 +659,7 @@ function Renderer.new(caps, theme)
 		oy = 0,
 		visible = true,
 		destroyed = false,
-		charRatio = 0.58, -- average glyph width / font size
+		charRatio = 0.62, -- average glyph width / font size (replaced by the measured value when possible)
 		lineRatio = 1.2, -- text line height / font size
 		nudge = 1, -- px added when vertically centring text (glyphs sit high in their line box)
 	}, Renderer)
@@ -707,6 +707,53 @@ end
 -- top Y that vertically centres one line of text of `size` inside a box
 function Renderer:CenterY(boxY, boxH, size)
 	return math.floor(boxY + (boxH - size * self.lineRatio) / 2 + self.nudge + 0.5)
+end
+
+-- real pixel width of a label's current text (nil when the executor cannot report it)
+function Renderer:RealWidth(node)
+	local ok, w = pcall(function()
+		local b = node.obj.TextBounds
+		return b and b.X
+	end)
+	if ok and type(w) == "number" and w > 0 then
+		return w
+	end
+	return nil
+end
+
+-- best known width of a label: the real measured width when it looks sane,
+-- otherwise a deliberately generous estimate so text errs on the side of fitting
+function Renderer:LabelWidth(node)
+	local est = ulen(node.text or "") * node.size * self.charRatio
+	local real = self:RealWidth(node)
+	if real and real >= est * 0.6 and real <= est * 2 then
+		return real
+	end
+	return est * 1.1
+end
+
+-- sets the label to `str`, cut with ".." so it is never wider than maxPx
+function Renderer:FitLabel(node, str, maxPx)
+	str = tostring(str)
+	local function width(s)
+		node:SetText(s)
+		return self:LabelWidth(node)
+	end
+	if width(str) <= maxPx then
+		return str
+	end
+	local lo, hi = 0, math.max(0, ulen(str) - 1) -- largest n where fit(str, n) fits
+	while lo < hi do
+		local mid = math.ceil((lo + hi) / 2)
+		if width(fit(str, mid)) <= maxPx then
+			lo = mid
+		else
+			hi = mid - 1
+		end
+	end
+	local out = fit(str, lo)
+	node:SetText(out)
+	return out
 end
 
 function Renderer:_register(node, group)
@@ -1603,15 +1650,16 @@ end
 -- Refresh (data -> drawing properties, change-only writes) -----------------------
 function UI:RefreshHeader()
 	local lib, r = self.lib, self.r
+	-- the version sits in a fixed spot at the right end of the header (left of the
+	-- HOME button); the title and subtitle are cut to the space left of it, using the
+	-- real measured text width, so they can never run into it
 	local ver = fit("v" .. cleanVersion(lib._version), 10)
-	local verW = r:TextWidth(ver, 10)
-	local avail = self.headerRight - 14 -- space between the left margin and the HOME button
-	-- the title may only use what the version label leaves free, so they can never overlap
-	local title = fit(lib._title, r:Capacity(avail - 8 - verW, 14))
-	self.titleLbl:SetText(title)
 	self.versionLbl:SetText(ver)
-	self.versionLbl:Move(14 + r:TextWidth(title, 14) + 8, 11)
-	self.subtitleLbl:SetText(fit(lib._subtitle, r:Capacity(avail, 10)))
+	local verX = self.headerRight - r:LabelWidth(self.versionLbl)
+	self.versionLbl:Move(verX, r:CenterY(0, L.HEADER - 1, 10))
+	local maxPx = verX - 16 - 14
+	r:FitLabel(self.titleLbl, lib._title, maxPx)
+	r:FitLabel(self.subtitleLbl, lib._subtitle, maxPx)
 end
 
 function UI:RefreshSearch()
@@ -1704,7 +1752,7 @@ end
 function UI:RefreshWelcome()
 	local lib = self.lib
 	local w = lib._welcome
-	self.welcomeTitle:SetText(fit(w.Title or ("Welcome to " .. titleCase(lib._title)), self.welcomeTitleChars))
+	self.r:FitLabel(self.welcomeTitle, w.Title or ("Welcome to " .. titleCase(lib._title)), self.cw - 8)
 	local sub = w.Subtitle or "Select a game from the library to explore its information and available features."
 	local lines = wrapText(sub, self.welcomeChars, #self.welcomeLines)
 	for i, node in ipairs(self.welcomeLines) do
@@ -1757,7 +1805,7 @@ function UI:RefreshGame(g)
 	local lib, r = self.lib, self.r
 	self.gameInitial:SetText(g._initial)
 	self:ApplyThumb(self.gameImg, self.gameInitial, g)
-	self.gameTitle:SetText(fit(g.Title, self.gameTitleChars))
+	r:FitLabel(self.gameTitle, g.Title, self.gameTitlePx)
 
 	-- second line only exists when there is something to put on it; otherwise the
 	-- title is centred against the icon so no empty gap is left under it
