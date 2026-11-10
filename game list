@@ -2,7 +2,7 @@
 --!nolint
 --[[
 ================================================================================
- UNIVERSAL  -  GAME SCRIPT LIBRARY                                  v1.0.0
+ UNIVERSAL  -  GAME SCRIPT LIBRARY                                  v1.1.0
  Single-file, Drawing-API based, black-and-white game launcher UI for Roblox.
 ================================================================================
 
@@ -19,8 +19,10 @@
    * Drawing.Fonts.Monospace is used when available (needed for accurate text
      wrapping). Other fonts work but text may be clipped/overlap slightly.
    * Optional (feature-detected, never required): getgenv  (single-instance guard).
-   * The Drawing API cannot capture input. Clicks on the window also reach the
-     game underneath. This is a platform limitation, not a bug.
+   * The Drawing API cannot capture mouse clicks. Clicks on the window also reach
+     the game underneath. This is a platform limitation, not a bug.
+     (The MOUSE WHEEL is handled: while the cursor is over the window the wheel
+     is sunk through ContextActionService so the game camera does not zoom.)
    * Drawing has no clipping. Lists therefore scroll in whole rows.
    * Game thumbnails need Drawing.new("Image") (Image.Data = PNG bytes) AND an
      HTTP function (request / http_request / syn.request / game:HttpGet) that can
@@ -42,6 +44,10 @@
    Library:SetWelcome(config)         Library:AddGame(config)
    Library:Notify(config | string)    Library:SetTheme(name | table)
    Library:Init() -> bool, err        Library:Destroy()
+
+ THEME KEYS (for SetTheme tables)
+   bg, panel, panel2, border, text, textDim, hover, muted, live,
+   btn, btnHover, btnHi, btnBorder, btnBorderHi, btnText   (button styling)
 
  THIS IS A SCRIPT LOADER
    The library only lists games and launches the script you attach to each one.
@@ -101,7 +107,7 @@
    B. ModuleScript: paste this file into a ModuleScript. It returns the library
       table, so:  local UL = require(path.To.UniversalLibrary)
    C. Remote (optional, executor-dependent, NEVER required by the library):
-        local URL = "https://YOUR-HOST/universal/v1.0.0/UniversalLibrary.lua"
+        local URL = "https://YOUR-HOST/universal/v1.1.0/UniversalLibrary.lua"
         local ok, src = pcall(function() return game:HttpGet(URL) end)
         assert(ok and type(src) == "string" and #src > 1000, "download failed")
         local fn, err = loadstring(src, "UniversalLibrary")
@@ -125,10 +131,11 @@
 ================================================================================
 ]]
 
-local LIB_VERSION = "1.0.0"
+local LIB_VERSION = "1.1.0"
 
 local LOG_TAG = "[Universal]"
 local ACTION_NAME = "UniversalLibrarySearchSink"
+local WHEEL_ACTION_NAME = "UniversalLibraryWheelSink"
 
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
@@ -189,12 +196,30 @@ local function usub(s, n)
 	return s:sub(1, n)
 end
 
+-- keeps the START of a string, adds ".." when it has to cut
 local function fit(s, maxChars)
 	s = tostring(s)
+	maxChars = math.max(0, math.floor(maxChars))
 	if ulen(s) <= maxChars then
 		return s
 	end
 	return usub(s, math.max(0, maxChars - 2)) .. ".."
+end
+
+-- keeps the END of a string (used by the search box so the caret stays visible)
+local function tail(s, maxChars)
+	s = tostring(s)
+	maxChars = math.max(0, math.floor(maxChars))
+	local n = ulen(s)
+	if n <= maxChars then
+		return s
+	end
+	local keep = math.max(0, maxChars - 2)
+	local ok, off = pcall(utf8.offset, s, n - keep + 1)
+	if ok and off then
+		return ".." .. s:sub(off)
+	end
+	return ".." .. s:sub(#s - keep + 1)
 end
 
 local function wrapText(str, maxChars, maxLines)
@@ -475,6 +500,13 @@ local Themes = {
 		hover = "#242424",
 		muted = "#6B6B6B",
 		live = "#3DDC84",
+		-- buttons: dark, subtle, white text
+		btn = "#1E1E1E",
+		btnHover = "#2B2B2B",
+		btnHi = "#292929",
+		btnBorder = "#363636",
+		btnBorderHi = "#555555",
+		btnText = "#FFFFFF",
 	},
 	Inverted = {
 		bg = "#F4F4F4",
@@ -486,12 +518,20 @@ local Themes = {
 		hover = "#D6D6D6",
 		muted = "#8A8A8A",
 		live = "#1E9E55",
+		btn = "#D2D2D2",
+		btnHover = "#C4C4C4",
+		btnHi = "#E2E2E2",
+		btnBorder = "#B4B4B4",
+		btnBorderHi = "#8E8E8E",
+		btnText = "#0B0B0B",
 	},
 }
 
 local THEME_LOOKUP = {
 	bg = "bg", panel = "panel", panel2 = "panel2", border = "border",
 	text = "text", textdim = "textDim", hover = "hover", muted = "muted", live = "live",
+	btn = "btn", btnhover = "btnHover", btnhi = "btnHi",
+	btnborder = "btnBorder", btnborderhi = "btnBorderHi", btntext = "btnText",
 }
 
 local function resolveTheme(name, overrides)
@@ -619,11 +659,13 @@ function Renderer.new(caps, theme)
 		oy = 0,
 		visible = true,
 		destroyed = false,
-		charRatio = 0.58,
+		charRatio = 0.58, -- average glyph width / font size
+		lineRatio = 1.2, -- text line height / font size
+		nudge = 1, -- px added when vertically centring text (glyphs sit high in their line box)
 	}, Renderer)
 end
 
--- measures the average glyph width of the chosen font once
+-- measures the average glyph width and the line height of the chosen font once
 function Renderer:MeasureFont()
 	local ok, obj = pcall(function()
 		return Drawing.new("Text")
@@ -642,6 +684,12 @@ function Renderer:MeasureFont()
 					self.charRatio = ratio
 				end
 			end
+			if b and b.Y > 0 then
+				local lr = b.Y / 20
+				if lr >= 0.9 and lr <= 1.8 then
+					self.lineRatio = lr
+				end
+			end
 		end)
 		destroyDrawing(obj)
 	end
@@ -651,8 +699,14 @@ function Renderer:TextWidth(str, size)
 	return ulen(str) * size * self.charRatio
 end
 
+-- how many characters fit in `px` pixels (small safety margin so text never touches an edge)
 function Renderer:Capacity(px, size)
-	return math.max(1, math.floor(px / (size * self.charRatio)))
+	return math.max(1, math.floor(px / (size * self.charRatio * 1.03)))
+end
+
+-- top Y that vertically centres one line of text of `size` inside a box
+function Renderer:CenterY(boxY, boxH, size)
+	return math.floor(boxY + (boxH - size * self.lineRatio) / 2 + self.nudge + 0.5)
 end
 
 function Renderer:_register(node, group)
@@ -844,11 +898,17 @@ local function keyToChar(kc, shift)
 	return DIGITS[name]
 end
 
+local uiCounter = 0
+
 local UI = {}
 UI.__index = UI
 
 function UI.new(lib, caps)
 	local self = setmetatable({}, UI)
+	uiCounter = uiCounter + 1
+	self.keyAction = ACTION_NAME .. uiCounter
+	self.wheelAction = WHEEL_ACTION_NAME .. uiCounter
+	self.wheelBound = false
 	self.lib, self.caps = lib, caps
 	self.janitor = Janitor.new()
 	self.regions, self.slots, self.featSlots, self.toastSlots = {}, {}, {}, {}
@@ -898,6 +958,11 @@ function UI:RegionAt(px, py, pred)
 	return best
 end
 
+function UI:OverWindow(px, py)
+	local r = self.r
+	return r.visible and px >= r.ox and px < r.ox + L.W and py >= r.oy and py < r.oy + L.H
+end
+
 function UI:SetHover(reg)
 	if reg == self.hover then
 		return
@@ -922,18 +987,26 @@ function UI:ReHover()
 end
 
 -- Button component -------------------------------------------------------
+-- Dark, low-contrast buttons with white text. Text is centred both ways from
+-- the measured font metrics. `primary` only adds a slightly brighter outline.
 function UI:Button(o)
 	local r = self.r
 	local size = o.size or 11
-	local b = { enabled = true, hover = false, active = false, primary = o.primary == true }
-	b.bg = r:Rect({ x = o.x, y = o.y, w = o.w, h = o.h, token = "panel2", group = o.group, z = o.z })
-	b.border = r:Rect({ x = o.x, y = o.y, w = o.w, h = o.h, filled = false, token = "border", group = o.group, z = o.z + 1 })
+	local x, y, w, h, z = o.x, o.y, o.w, o.h, o.z or 6
+	local b = {
+		enabled = true, hover = false, active = false, primary = o.primary == true,
+		maxChars = r:Capacity(w - 12, size),
+	}
+	b.bg = r:Rect({ x = x, y = y, w = w, h = h, token = "btn", group = o.group, z = z })
+	b.hi = r:Rect({ x = x + 1, y = y + 1, w = w - 2, h = 1, token = "btnHi", group = o.group, z = z + 1 })
+	b.border = r:Rect({ x = x, y = y, w = w, h = h, filled = false, token = "btnBorder", group = o.group, z = z + 1 })
 	b.label = r:Label({
-		x = o.x + o.w / 2, y = o.y + math.floor((o.h - size) / 2) - 1, size = size,
-		align = "center", token = "text", group = o.group, z = o.z + 2, text = o.text or "",
+		x = x + w / 2, y = r:CenterY(y, h, size), size = size,
+		align = "center", token = "btnText", group = o.group, z = z + 2,
+		text = fit(o.text or "", b.maxChars),
 	})
 	b.region = self:AddRegion({
-		x = o.x, y = o.y, w = o.w, h = o.h, group = o.group, z = o.z, tooltip = o.tooltip,
+		x = x, y = y, w = w, h = h, group = o.group, z = z, tooltip = o.tooltip,
 		onClick = function()
 			if b.enabled and o.onClick then
 				o.onClick(b)
@@ -950,30 +1023,29 @@ function UI:Button(o)
 	})
 	function b:Refresh()
 		local hot = self.hover and self.enabled
-		if self.primary then
-			-- solid call-to-action: filled light button with dark text, dims on hover
-			if self.enabled then
-				local tok = hot and "textDim" or "text"
-				self.bg:SetToken(tok)
-				self.border:SetToken(tok)
-				self.label:SetToken("bg")
-			else
-				self.bg:SetToken("panel2")
-				self.border:SetToken("border")
-				self.label:SetToken("muted")
-			end
+		if not self.enabled then
+			self.bg:SetToken("panel")
+			self.hi:SetToken("panel")
+			self.border:SetToken("border")
+			self.label:SetToken("muted")
 		elseif self.active then
-			self.bg:SetToken("text")
-			self.border:SetToken("text")
-			self.label:SetToken("bg")
+			self.bg:SetToken("btnHover")
+			self.hi:SetToken("btnHi")
+			self.border:SetToken("btnBorderHi")
+			self.label:SetToken("btnText")
 		else
-			self.bg:SetToken(hot and "hover" or "panel2")
-			self.border:SetToken(hot and "textDim" or "border")
-			self.label:SetToken(self.enabled and "text" or "muted")
+			self.bg:SetToken(hot and "btnHover" or "btn")
+			self.hi:SetToken("btnHi")
+			if self.primary then
+				self.border:SetToken(hot and "textDim" or "btnBorderHi")
+			else
+				self.border:SetToken(hot and "btnBorderHi" or "btnBorder")
+			end
+			self.label:SetToken("btnText")
 		end
 	end
 	function b:SetText(s)
-		self.label:SetText(s)
+		self.label:SetText(fit(s, self.maxChars))
 	end
 	function b:SetEnabled(e)
 		self.enabled = e
@@ -985,10 +1057,12 @@ function UI:Button(o)
 	end
 	function b:Show(s)
 		self.bg:Show(s)
+		self.hi:Show(s)
 		self.border:Show(s)
 		self.label:Show(s)
 		self.region.on = s
 	end
+	b:Refresh()
 	return b
 end
 
@@ -1017,12 +1091,14 @@ function UI:Build()
 	self.titleLbl = r:Label({ x = 14, y = 8, size = 14, token = "text", group = gHeader, z = 6 })
 	self.versionLbl = r:Label({ x = 100, y = 11, size = 10, token = "muted", group = gHeader, z = 6 })
 	self.subtitleLbl = r:Label({ x = 14, y = 27, size = 10, token = "textDim", group = gHeader, z = 6 })
+	local homeX = W - 34 - 8 - 60
+	self.headerRight = homeX - 14 -- text in the header must end before the HOME button
 	self.btnClose = self:Button({
-		x = W - 34, y = 11, w = 24, h = 24, text = "x", group = gHeader, z = 6,
+		x = W - 34, y = 11, w = 24, h = 24, text = "X", group = gHeader, z = 6,
 		onClick = function() lib:Destroy() end, tooltip = "Close",
 	})
 	self.btnHome = self:Button({
-		x = W - 34 - 8 - 56, y = 11, w = 56, h = 24, text = "HOME", group = gHeader, z = 6,
+		x = homeX, y = 11, w = 60, h = 24, text = "HOME", group = gHeader, z = 6,
 		onClick = function() lib:_selectGame(nil) end, tooltip = "Back to the welcome page",
 	})
 	self.btnHome:Show(false)
@@ -1038,7 +1114,7 @@ function UI:Build()
 	local sw = SB - 20
 	self.searchBg = r:Rect({ x = 10, y = sy, w = sw, h = 28, token = "panel2", group = gBody, z = 3 })
 	self.searchBorder = r:Rect({ x = 10, y = sy, w = sw, h = 28, filled = false, token = "border", group = gBody, z = 4 })
-	self.searchLbl = r:Label({ x = 20, y = sy + 8, size = 12, token = "muted", group = gBody, z = 6 })
+	self.searchLbl = r:Label({ x = 20, y = r:CenterY(sy, 28, 12), size = 12, token = "muted", group = gBody, z = 6 })
 	self.searchChars = r:Capacity(sw - 20, 12)
 	self:AddRegion({ id = "search", x = 10, y = sy, w = sw, h = 28, group = gBody, z = 3, tooltip = "Click to type; Esc clears" })
 
@@ -1046,7 +1122,7 @@ function UI:Build()
 	local slotCount = math.max(1, math.floor((H - 10 - listY) / L.ROW_H))
 	self.listY, self.listH = listY, slotCount * L.ROW_H
 	local rowW = SB - 22
-	local textPx = SB - 80
+	local textPx = rowW + 6 - 54 - 8 -- from the text column to the right edge of the row
 	self.rowTitleChars, self.rowDescChars = r:Capacity(textPx, 13), r:Capacity(textPx, 10)
 	for i = 1, slotCount do
 		local y = listY + (i - 1) * L.ROW_H
@@ -1055,7 +1131,7 @@ function UI:Build()
 		slot.bar = r:Rect({ x = 6, y = y + 6, w = 2, h = L.ROW_H - 14, token = "panel", group = gBody, z = 5 })
 		slot.img = r:Image({ x = 17, y = y + 6, w = 26, h = 26, group = gBody, z = 4 })
 		slot.box = r:Rect({ x = 16, y = y + 5, w = 28, h = 28, filled = false, token = "border", group = gBody, z = 5 })
-		slot.initial = r:Label({ x = 30, y = y + 11, size = 13, align = "center", token = "textDim", group = gBody, z = 6 })
+		slot.initial = r:Label({ x = 30, y = r:CenterY(y + 5, 28, 13), size = 13, align = "center", token = "textDim", group = gBody, z = 6 })
 		slot.title = r:Label({ x = 54, y = y + 6, size = 13, token = "text", group = gBody, z = 6 })
 		slot.desc = r:Label({ x = 54, y = y + 22, size = 10, token = "muted", group = gBody, z = 6 })
 		slot.nodes = { slot.bg, slot.bar, slot.img, slot.box, slot.initial, slot.title, slot.desc }
@@ -1095,45 +1171,56 @@ function UI:Build()
 		end,
 	})
 
-	-- welcome view ------------------------------------------------------
-	local top = HEADER + 16
-	self.gameTop = top
-	self.welcomeTitle = r:Label({ x = cx, y = top + 8, size = 20, token = "text", group = gWelcome, z = 6 })
-	self.welcomeTitleChars = r:Capacity(cw, 20)
-	self.welcomeChars = r:Capacity(cw, 12)
+	-- welcome view (everything centred in the content area, block centred vertically) --
+	local mid = math.floor(cx + cw / 2)
+	local TITLE_LH, SUB_LH, CARD_H, BTN_H = 24, 17, 64, 32
+	local blockH = TITLE_LH + 12 + SUB_LH * 2 + 26 + CARD_H + 26 + BTN_H
+	local wy = HEADER + math.floor((H - HEADER - blockH) / 2) - 6
+	self.welcomeTitle = r:Label({ x = mid, y = wy, size = 20, align = "center", token = "text", group = gWelcome, z = 6 })
+	self.welcomeTitleChars = r:Capacity(cw - 8, 20)
+	self.welcomeChars = r:Capacity(cw - 24, 12)
 	for i = 1, 2 do
-		self.welcomeLines[i] = r:Label({ x = cx, y = top + 44 + (i - 1) * 16, size = 12, token = "textDim", group = gWelcome, z = 6 })
+		self.welcomeLines[i] = r:Label({
+			x = mid, y = wy + TITLE_LH + 12 + (i - 1) * SUB_LH, size = 12, align = "center",
+			token = "textDim", group = gWelcome, z = 6,
+		})
 	end
-	local cardW = math.floor((cw - 16) / 3)
+	local gap = 10
+	local cardW = math.floor((cw - gap * 2) / 3)
+	local cardsX = cx + math.floor((cw - (cardW * 3 + gap * 2)) / 2)
+	local cardY = wy + TITLE_LH + 12 + SUB_LH * 2 + 26
+	self.cardChars = r:Capacity(cardW - 20, 18)
 	for i = 1, 3 do
-		local x = cx + (i - 1) * (cardW + 8)
-		local y = top + 96
+		local x = cardsX + (i - 1) * (cardW + gap)
+		local cmid = x + math.floor(cardW / 2)
 		local card = {}
-		card.bg = r:Rect({ x = x, y = y, w = cardW, h = 58, token = "panel", group = gWelcome, z = 3 })
-		card.border = r:Rect({ x = x, y = y, w = cardW, h = 58, filled = false, token = "border", group = gWelcome, z = 4 })
-		card.label = r:Label({ x = x + 12, y = y + 10, size = 10, token = "textDim", group = gWelcome, z = 6 })
-		card.value = r:Label({ x = x + 12, y = y + 28, size = 18, token = "text", group = gWelcome, z = 6 })
+		card.bg = r:Rect({ x = x, y = cardY, w = cardW, h = CARD_H, token = "panel", group = gWelcome, z = 3 })
+		card.border = r:Rect({ x = x, y = cardY, w = cardW, h = CARD_H, filled = false, token = "border", group = gWelcome, z = 4 })
+		card.bar = r:Rect({ x = x + 1, y = cardY + 1, w = cardW - 2, h = 2, token = "live", group = gWelcome, z = 5 })
+		card.label = r:Label({ x = cmid, y = cardY + 13, size = 10, align = "center", token = "textDim", group = gWelcome, z = 6 })
+		card.value = r:Label({ x = cmid, y = cardY + 31, size = 18, align = "center", token = "text", group = gWelcome, z = 6 })
 		self.cards[i] = card
 	end
-	self.placeHint = r:Label({ x = cx, y = top + 170, size = 11, token = "textDim", group = gWelcome, z = 6 })
 	local wbW = 180
-	self.welcomeBtnChars = r:Capacity(wbW - 20, 12)
 	self.welcomeBtn = self:Button({
-		x = cx, y = top + 196, w = wbW, h = 30, text = "", size = 12, primary = true, group = gWelcome, z = 7,
+		x = cx + math.floor((cw - wbW) / 2), y = cardY + CARD_H + 26, w = wbW, h = BTN_H, text = "", size = 12,
+		primary = true, group = gWelcome, z = 7,
 		onClick = function() lib:_welcomeAction() end,
 	})
 
 	-- game view ----------------------------------------------------------
-	local ICON, runW, runH = 52, 84, 30
+	local top = HEADER + 16
+	self.gameTop = top
+	local ICON, runW, runH = 52, 88, 32
+	self.iconSize = ICON
 	self.gameImg = r:Image({ x = cx + 1, y = top + 1, w = ICON - 2, h = ICON - 2, group = gGame, z = 4 })
 	self.gameBox = r:Rect({ x = cx, y = top, w = ICON, h = ICON, filled = false, token = "text", group = gGame, z = 5 })
-	self.gameInitial = r:Label({ x = cx + ICON / 2, y = top + ICON / 2 - 12, size = 20, align = "center", token = "text", group = gGame, z = 6 })
+	self.gameInitial = r:Label({ x = cx + ICON / 2, y = r:CenterY(top, ICON, 20), size = 20, align = "center", token = "text", group = gGame, z = 6 })
 	local textX = cx + ICON + 14
-	local titlePx = cw - ICON - 14 - runW - 12
-	self.gameTextX = textX
+	local titlePx = cw - ICON - 14 - runW - 14
+	self.gameTextX, self.gameTitlePx = textX, titlePx
 	self.gameTitleChars = r:Capacity(titlePx, 18)
 	self.gameTitle = r:Label({ x = textX, y = top + 8, size = 18, token = "text", group = gGame, z = 6 })
-	self.infoChars = r:Capacity(titlePx, 10)
 	self.gameInfo = r:Label({ x = textX, y = top + 31, size = 10, token = "textDim", group = gGame, z = 6 })
 	self.liveW = r:TextWidth("CURRENT GAME", 10)
 	self.gameLiveDot = r:Rect({ x = textX, y = top + 33, w = 6, h = 6, token = "live", group = gGame, z = 6 })
@@ -1155,7 +1242,7 @@ function UI:Build()
 			return lib:_hasScript(g) and "Run this script and close the loader" or "No script attached"
 		end,
 	})
-	self.descChars = r:Capacity(cw, 12)
+	self.descChars = r:Capacity(cw - 4, 12)
 	for i = 1, 3 do
 		self.descLines[i] = r:Label({ x = cx, y = top + ICON + 14 + (i - 1) * 15, size = 12, token = "textDim", group = gGame, z = 6 })
 	end
@@ -1171,11 +1258,11 @@ function UI:Build()
 	self.featChars = r:Capacity(cw - 8, 12)
 	for i = 1, rows do
 		local y = listTop + (i - 1) * L.LIST_ROW
-		self.featSlots[i] = { label = r:Label({ x = cx, y = y + 3, size = 12, token = "text", group = gGame, z = 6 }) }
+		self.featSlots[i] = { label = r:Label({ x = cx, y = r:CenterY(y, L.LIST_ROW, 12), size = 12, token = "text", group = gGame, z = 6 }) }
 	end
 	self.featTrack = r:Rect({ x = W - 10, y = listTop, w = 3, h = self.featListH, token = "border", group = gGame, z = 3 })
 	self.featThumb = r:Rect({ x = W - 10, y = listTop, w = 3, h = 20, token = "textDim", group = gGame, z = 4 })
-	self.featEmpty = r:Label({ x = cx, y = listTop + 3, size = 12, token = "muted", group = gGame, z = 6 })
+	self.featEmpty = r:Label({ x = cx, y = r:CenterY(listTop, L.LIST_ROW, 12), size = 12, token = "muted", group = gGame, z = 6 })
 	self:AddRegion({
 		x = cx, y = listTop, w = cw, h = self.featListH, group = gGame, z = 2,
 		onScroll = function(d)
@@ -1185,7 +1272,8 @@ function UI:Build()
 	})
 
 	-- toasts -------------------------------------------------------------
-	self.toastChars = r:Capacity(L.TOAST_W - 24, 10)
+	self.toastTitleChars = r:Capacity(L.TOAST_W - 24, 12)
+	self.toastMsgChars = r:Capacity(L.TOAST_W - 24, 10)
 	for i = 1, 3 do
 		local grp = newGroup(nil)
 		grp.hidden = true
@@ -1243,6 +1331,50 @@ function UI:Bind()
 			self:OnKey(input)
 		end
 	end)
+
+	-- Mouse wheel: while the cursor is over the window the wheel is sunk (so the
+	-- game camera does not zoom) and used to scroll the lists instead.
+	self._wheelHandler = function(_, _, input)
+		local ok, sink = pcall(self.OnWheel, self, input)
+		if ok and sink then
+			return Enum.ContextActionResult.Sink
+		end
+		return Enum.ContextActionResult.Pass
+	end
+	local bound = pcall(function()
+		ContextActionService:BindActionAtPriority(
+			self.wheelAction, self._wheelHandler, false, 3000, Enum.UserInputType.MouseWheel
+		)
+	end)
+	self.wheelBound = bound
+	if bound then
+		j:Add(function()
+			pcall(function()
+				ContextActionService:UnbindAction(self.wheelAction)
+			end)
+		end)
+	end
+end
+
+-- returns true when the wheel event belongs to the UI (and must not reach the game)
+function UI:OnWheel(input)
+	if self.dead or not self.r.visible then
+		return false
+	end
+	local m = UserInputService:GetMouseLocation()
+	if not self:OverWindow(m.X, m.Y) then
+		return false
+	end
+	local z = input.Position.Z
+	if z ~= 0 then
+		local reg = self:RegionAt(m.X, m.Y, function(g)
+			return g.onScroll ~= nil
+		end)
+		if reg then
+			reg.onScroll(z > 0 and -1 or 1)
+		end
+	end
+	return true
 end
 
 function UI:OnInputBegan(input, processed)
@@ -1277,22 +1409,16 @@ function UI:OnInputChanged(input)
 		local m = UserInputService:GetMouseLocation()
 		if self.drag then
 			local vp = viewportSize()
-			local h = L.H
 			self.r:SetOrigin(
 				clamp(m.X - self.drag.dx, 0, math.max(0, vp.X - L.W)),
-				clamp(m.Y - self.drag.dy, 0, math.max(0, vp.Y - h))
+				clamp(m.Y - self.drag.dy, 0, math.max(0, vp.Y - L.H))
 			)
 		else
 			self:SetHover(self:RegionAt(m.X, m.Y))
 		end
-	elseif t == Enum.UserInputType.MouseWheel then
-		local m = UserInputService:GetMouseLocation()
-		local reg = self:RegionAt(m.X, m.Y, function(g)
-			return g.onScroll ~= nil
-		end)
-		if reg then
-			reg.onScroll(input.Position.Z > 0 and -1 or 1)
-		end
+	elseif t == Enum.UserInputType.MouseWheel and not self.wheelBound then
+		-- fallback only: when ContextActionService could not bind the wheel sink
+		self:OnWheel(input)
 	end
 end
 
@@ -1305,7 +1431,7 @@ function UI:SetFocus(b)
 	if b then
 		pcall(function()
 			ContextActionService:BindActionAtPriority(
-				ACTION_NAME,
+				self.keyAction,
 				function(...)
 					self._keyHandler(...)
 					return Enum.ContextActionResult.Sink
@@ -1315,7 +1441,7 @@ function UI:SetFocus(b)
 		end)
 	else
 		pcall(function()
-			ContextActionService:UnbindAction(ACTION_NAME)
+			ContextActionService:UnbindAction(self.keyAction)
 		end)
 	end
 	if not self.dead then
@@ -1368,10 +1494,9 @@ function UI:ClampWindow()
 		return
 	end
 	local vp = viewportSize()
-	local h = L.H
 	self.r:SetOrigin(
 		clamp(self.r.ox, 0, math.max(0, vp.X - L.W)),
-		clamp(self.r.oy, 0, math.max(0, vp.Y - h))
+		clamp(self.r.oy, 0, math.max(0, vp.Y - L.H))
 	)
 end
 
@@ -1424,6 +1549,7 @@ function UI:ShowTooltip(text)
 	local r = self.r
 	local m = UserInputService:GetMouseLocation()
 	local vp = viewportSize()
+	text = fit(text, r:Capacity(math.max(40, vp.X - 40), 11)) -- never wider than the screen
 	local w = r:TextWidth(text, 11) + 16
 	local x = clamp(m.X + 14, 0, math.max(0, vp.X - w))
 	local y = clamp(m.Y + 20, 0, math.max(0, vp.Y - 22))
@@ -1432,7 +1558,7 @@ function UI:ShowTooltip(text)
 	self.tipBg:Move(x, y)
 	self.tipBorder:Move(x, y)
 	self.tipLbl:SetText(text)
-	self.tipLbl:Move(x + 8, y + 5)
+	self.tipLbl:Move(x + 8, r:CenterY(y, 22, 11))
 	r:SetGroupHidden(self.groups.tip, false)
 end
 
@@ -1453,8 +1579,8 @@ function UI:ShowToast(slot, item)
 	slot.active = true
 	slot.token = slot.token + 1
 	local token = slot.token
-	slot.title:SetText(fit(item.title, self.toastChars))
-	slot.msg:SetText(fit(item.message, self.toastChars + 4))
+	slot.title:SetText(fit(item.title, self.toastTitleChars))
+	slot.msg:SetText(fit(item.message, self.toastMsgChars))
 	self.r:SetGroupHidden(slot.group, false)
 	task.delay(item.duration, function()
 		if not self.dead and slot.token == token then
@@ -1477,11 +1603,15 @@ end
 -- Refresh (data -> drawing properties, change-only writes) -----------------------
 function UI:RefreshHeader()
 	local lib, r = self.lib, self.r
-	local title = fit(lib._title, 40)
+	local ver = fit("v" .. cleanVersion(lib._version), 10)
+	local verW = r:TextWidth(ver, 10)
+	local avail = self.headerRight - 14 -- space between the left margin and the HOME button
+	-- the title may only use what the version label leaves free, so they can never overlap
+	local title = fit(lib._title, r:Capacity(avail - 8 - verW, 14))
 	self.titleLbl:SetText(title)
-	self.subtitleLbl:SetText(fit(lib._subtitle, 60))
-	self.versionLbl:SetText("v" .. cleanVersion(lib._version))
+	self.versionLbl:SetText(ver)
 	self.versionLbl:Move(14 + r:TextWidth(title, 14) + 8, 11)
+	self.subtitleLbl:SetText(fit(lib._subtitle, r:Capacity(avail, 10)))
 end
 
 function UI:RefreshSearch()
@@ -1490,7 +1620,8 @@ function UI:RefreshSearch()
 		self.searchLbl:SetText("Search games...")
 		self.searchLbl:SetToken("muted")
 	else
-		self.searchLbl:SetText(fit(q .. (self.focused and "|" or ""), self.searchChars))
+		-- show the END of the text so the caret never leaves the box
+		self.searchLbl:SetText(tail(q, self.searchChars - (self.focused and 1 or 0)) .. (self.focused and "|" or ""))
 		self.searchLbl:SetToken("text")
 	end
 	self.searchBorder:SetToken(self.focused and "textDim" or "border")
@@ -1575,7 +1706,7 @@ function UI:RefreshWelcome()
 	local w = lib._welcome
 	self.welcomeTitle:SetText(fit(w.Title or ("Welcome to " .. titleCase(lib._title)), self.welcomeTitleChars))
 	local sub = w.Subtitle or "Select a game from the library to explore its information and available features."
-	local lines = wrapText(sub, self.welcomeChars, 2)
+	local lines = wrapText(sub, self.welcomeChars, #self.welcomeLines)
 	for i, node in ipairs(self.welcomeLines) do
 		node:SetText(lines[i] or "")
 	end
@@ -1586,14 +1717,16 @@ function UI:RefreshWelcome()
 		{ "VERSION", cleanVersion(lib._version) },
 	}
 	for i, card in ipairs(self.cards) do
+		local isLive = (i == 2 and m ~= nil)
 		card.label:SetText(data[i][1])
-		card.value:SetText(fit(data[i][2], 9))
+		card.value:SetText(fit(data[i][2], self.cardChars))
+		card.value:SetToken(isLive and "live" or "text")
+		card.bar:Show(isLive)
 	end
-	self.placeHint:SetText(m and fit("Current place matches: " .. m.Title, self.welcomeChars) or "")
 	local b = w.Button
 	self.welcomeBtn:Show(b ~= nil)
 	if b then
-		self.welcomeBtn:SetText(fit(b.Text, self.welcomeBtnChars))
+		self.welcomeBtn:SetText(b.Text)
 		self.welcomeBtn:SetEnabled(true)
 	end
 end
@@ -1621,7 +1754,7 @@ function UI:ApplyThumb(img, initial, g)
 end
 
 function UI:RefreshGame(g)
-	local lib = self.lib
+	local lib, r = self.lib, self.r
 	self.gameInitial:SetText(g._initial)
 	self:ApplyThumb(self.gameImg, self.gameInitial, g)
 	self.gameTitle:SetText(fit(g.Title, self.gameTitleChars))
@@ -1631,15 +1764,18 @@ function UI:RefreshGame(g)
 	local live = lib._matchedId == g.Id
 	local top, tx = self.gameTop, self.gameTextX
 	local infoY = top + 31
-	self.gameTitle:Move(tx, (live or g.Version) and (top + 8) or (top + 16))
+	self.gameTitle:Move(tx, (live or g.Version) and (top + 8) or r:CenterY(top, self.iconSize, 18))
 	self.gameLiveDot:Show(live)
 	self.gameLiveLbl:Show(live)
 	if live then
 		self.gameLiveDot:Move(tx, infoY + 2)
 		self.gameLiveLbl:Move(tx + 14, infoY)
 	end
-	self.gameInfo:Move(live and (tx + 14 + self.liveW + 14) or tx, infoY)
-	self.gameInfo:SetText(g.Version and fit("v" .. cleanVersion(g.Version), self.infoChars) or "")
+	local infoX = live and (tx + 14 + self.liveW + 14) or tx
+	self.gameInfo:Move(infoX, infoY)
+	-- the version may only use the space left of the RUN button after the live label
+	local infoPx = (tx + self.gameTitlePx) - infoX
+	self.gameInfo:SetText(g.Version and fit("v" .. cleanVersion(g.Version), r:Capacity(infoPx, 10)) or "")
 
 	self.runBtn:SetEnabled(lib:_hasScript(g))
 	local desc = (g.Description and g.Description ~= "") and g.Description or "No description provided."
@@ -1714,7 +1850,7 @@ function UI:Destroy()
 	self.dead = true
 	self.tipToken = self.tipToken + 1
 	self.filterToken = self.filterToken + 1
-	self.janitor:Cleanup()
+	self.janitor:Cleanup() -- also unbinds the wheel sink
 	self.r:Destroy()
 	self.regions = {}
 end
@@ -1737,7 +1873,7 @@ end
 -- Console-only diagnostics (no on-screen log). Consecutive duplicates are dropped
 -- so a failing callback cannot flood the output.
 function Library:_log(level, msg)
-	msg = tostring(msg):gsub("%s+", " ")
+	msg = (tostring(msg):gsub("%s+", " "))
 	local key = level .. ":" .. msg
 	if self._lastLog == key then
 		return
@@ -2023,7 +2159,8 @@ function Library:AddGame(config)
 	g.PlaceIds = placeIds
 	g.Version = config.Version ~= nil and tostring(config.Version) or nil
 	g.Features = features
-	g._initial = (config.Icon and #config.Icon > 0 and #config.Icon <= 3) and config.Icon
+	local icon = config.Icon and trim(config.Icon) or ""
+	g._initial = (ulen(icon) > 0 and ulen(icon) <= 3) and icon
 		or (title:match("%w") or "?"):upper()
 	g._search = (title .. " " .. g.Description):lower()
 	local thumbId = tonumber(config.IconPlaceId) or (placeIds and placeIds[1])
@@ -2047,7 +2184,7 @@ function Library:Notify(config)
 	end
 	local item = {
 		title = isString(config.Title) and config.Title or self._title,
-		message = tostring(config.Message or config.Text or config.Content or ""),
+		message = (tostring(config.Message or config.Text or config.Content or ""):gsub("%s+", " ")),
 		duration = clamp(tonumber(config.Duration) or 3, 1, 15),
 	}
 	self:_log("info", item.title .. ": " .. item.message)
@@ -2073,6 +2210,9 @@ local function resolveRunner(g)
 	if type(sc) == "string" and sc ~= "" then
 		return function()
 			local src = game:HttpGet(sc)
+			if type(src) ~= "string" or src == "" then
+				error("empty response from " .. sc, 0)
+			end
 			local fn, err = loadstring(src, "=" .. g.Title)
 			if not fn then
 				error(err, 0)
@@ -2153,13 +2293,14 @@ function Library:Init()
 		return false, msg
 	end
 
+	-- remove a previous instance first so its input bindings cannot linger
 	local env = getEnvTable()
 	if env and self._singleInstance then
 		local prev = env.__UniversalLibraryInstance
 		if prev and prev ~= self and type(prev.Destroy) == "function" then
 			pcall(prev.Destroy, prev)
 		end
-		env.__UniversalLibraryInstance = self
+		env.__UniversalLibraryInstance = nil
 	end
 
 	local ui = UI.new(self, caps)
@@ -2173,6 +2314,9 @@ function Library:Init()
 		return false, tostring(err)
 	end
 	self._ui = ui
+	if env and self._singleInstance then
+		env.__UniversalLibraryInstance = self -- only registered once the UI really exists
+	end
 	self:_computeMatch()
 	self:_rebuildFilter()
 	ui:RefreshAll()
